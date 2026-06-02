@@ -1,0 +1,24 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "classpass-trigger",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-05-12",
+	"triggers": {
+      "crons": ["0 3 * * *"]
+    },
+	"vars": {
+		"GITHUB_REPO": "fredkchoi/classpass-scraper",
+		"DISPATCH_EVENT_TYPE": "midnight-booker"
+	},
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true,
+	"compatibility_flags": [
+		"nodejs_compat"
+	]
+}
