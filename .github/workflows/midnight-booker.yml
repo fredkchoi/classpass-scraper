@@ -1,5 +1,7 @@
 name: Midnight Booker
 
+# Triggered nightly by the cf-trigger Cloudflare Worker, with GHA schedule as backup.
+
 on:
   # Primary trigger: Cloudflare Worker (`cf-trigger/`) fires `repository_dispatch`
   # at 03:00 UTC. CF crons are reliable to within a minute; GHA schedule crons
