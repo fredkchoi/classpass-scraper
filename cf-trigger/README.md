@@ -24,14 +24,17 @@ Cloudflare cron fires at `0 3 * * *` (03:00 UTC = 11:00pm EDT / 10:00pm EST), th
 
 ## Verify
 
+To manually fire the scheduled handler locally and confirm the GitHub dispatch works:
+
 ```bash
-# Manually trigger the Worker:
-npx wrangler triggers cron --cron "0 3 * * *"
+npx wrangler dev --test-scheduled
+# In a second terminal:
+curl "http://localhost:8787/__scheduled?cron=0+3+*+*+*"
 # Then check the target repo:
 gh run list --workflow=midnight-booker.yml --limit 3
 ```
 
-You should see a new run with `event = repository_dispatch`.
+You should see a new run with `event = repository_dispatch`. The production Worker fires automatically at 03:00 UTC nightly.
 
 ## Multi-timezone caveat
 
