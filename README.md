@@ -97,7 +97,18 @@ Pre-populate this with everything you want to book. The hourly scheduler picks u
 
 Each target is one intention ("get me into a class on June 10 evening"). The `preferences` array lists priority-ordered alternatives — the bot tries them in order at the release moment and the first one that succeeds wins. The confirmation email lists every preference and notes which one was booked.
 
-Top-level fields are inherited by every preference; per-preference fields override. So if every preference shares the same venue, date, and class name, you only write those once.
+Top-level fields are inherited by every preference; per-preference fields override. So if every preference shares the same venue, date, and class name, you only write those once. Any field in the table below works at either level, so a preference can override the venue, date, class name filter, max credits, etc. For example, to mostly look for `Signature50` but accept `Foundation50` at the 10:15 PM slot as a last resort:
+
+```json
+{
+  "class_name_contains": "Signature50",
+  "preferences": [
+    {"time": "19:15"},
+    {"time": "20:15"},
+    {"time": "22:15", "class_name_contains": "Foundation50"}
+  ]
+}
+```
 
 | Field | Level | Required | Description |
 |---|---|---|---|
