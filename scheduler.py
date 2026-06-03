@@ -266,11 +266,9 @@ def _is_affordable(cls: dict | None, balance: int | None) -> bool:
     return credits_cost <= balance
 
 
-def process_target(target: dict, run_start: datetime) -> dict:
+def process_target(target: dict, run_start: datetime, balance: int | None) -> dict:
     """Run the per-target decision loop. Returns the updated target dict, or
     `{"_booked": True}` if any preference was successfully booked."""
-    from book import fetch_credit_balance
-
     prefs = expand_preferences(target)
     target_label = target.get("label") or (
         f"venue {prefs[0]['venue_id']} {prefs[0]['date']}" if prefs else "(empty target)"
@@ -278,12 +276,6 @@ def process_target(target: dict, run_start: datetime) -> dict:
     print(f"\n=== {target_label} ===")
     if not prefs:
         return target
-
-    balance = fetch_credit_balance()
-    if balance is None:
-        print("Credit balance: unknown (won't filter by affordability)")
-    else:
-        print(f"Credit balance: {balance} credits")
 
     # Match every preference once up front
     matched = []
@@ -351,7 +343,27 @@ def process_target(target: dict, run_start: datetime) -> dict:
     return target
 
 
+def _maybe_notify_token_stale(balance: int | None):
+    """If the balance check failed at run start, fire a one-shot email so the user
+    knows to rotate CLASSPASS_AUTH_TOKEN. Soft gate: we still let the run continue."""
+    if balance is not None:
+        print(f"Credit balance: {balance} credits")
+        return
+    body = (
+        "Could not fetch your ClassPass credit balance, which usually means "
+        "CLASSPASS_AUTH_TOKEN is stale.\n\n"
+        "Capture a fresh token from DevTools and update it in GitHub Secrets "
+        "(see README, 'Capturing your ClassPass auth token').\n\n"
+        "Booking attempts will likely fail until the token is rotated.\n\n"
+        "- Your ClassPass Bot"
+    )
+    print(body)
+    send_email(subject="ClassPass: auth token may be stale", body=body)
+
+
 def main():
+    from book import fetch_credit_balance
+
     targets = load_targets()
 
     errors = validate_targets(targets)
@@ -366,6 +378,9 @@ def main():
         print("No targets to process.")
         return
 
+    balance = fetch_credit_balance()
+    _maybe_notify_token_stale(balance)
+
     run_start = datetime.now(ZoneInfo("UTC"))
     new_targets: list = []
 
@@ -373,7 +388,7 @@ def main():
         if target.get("status") == "polling":
             new_targets.append(target)
             continue
-        result = process_target(target, run_start)
+        result = process_target(target, run_start, balance)
         if not result.get("_booked"):
             new_targets.append(result)
 

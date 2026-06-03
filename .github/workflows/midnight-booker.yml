@@ -47,8 +47,6 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           CLASSPASS_AUTH_TOKEN: ${{ secrets.CLASSPASS_AUTH_TOKEN }}
           CLASSPASS_USER_ID: ${{ secrets.CLASSPASS_USER_ID }}
-          CLASSPASS_EMAIL: ${{ secrets.CLASSPASS_EMAIL }}
-          CLASSPASS_PASSWORD: ${{ secrets.CLASSPASS_PASSWORD }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}

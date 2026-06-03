@@ -20,8 +20,7 @@ The booking job is triggered by a Cloudflare Worker cron (more reliable than GHA
 | File | Purpose |
 |---|---|
 | `scheduler.py` | Hourly runner. Queries the schedule API per target, branches on `availability.status`/`reason`. Books immediately if `available`, polls if `out_of_spots`, parses `credits_reasons` for the release moment if `before_opening_window` and waits until then if within 75 min |
-| `book.py` | Booking logic: `POST /_api/v1/users/{user_id}/reservations` with `{schedule, credits}` + retry-on-401 |
-| `auth.py` | Email/password login to refresh `CLASSPASS_AUTH_TOKEN`. **Login endpoint is currently a stub**, needs the actual login request captured from DevTools to be wired in |
+| `book.py` | Booking logic: `POST /_api/v1/users/{user_id}/reservations` with `{schedule, credits}`. Also exposes `fetch_credit_balance()` which is used both for affordability filtering and as the auth health check |
 | `availability.py` | `POST /_api/v3/search/schedules` via `curl_cffi` (impersonates Chrome's TLS handshake to defeat Cloudflare bot detection) |
 | `cancellation_poller.py` | Hourly job that watches polling targets. Auto-books via `attempt_booking` when a matching slot opens; emails if no token is configured or booking fails |
 | `gcal.py` | Google Calendar event creation after a booking |
@@ -44,11 +43,11 @@ The booking job is triggered by a Cloudflare Worker cron (more reliable than GHA
 
 ## Auth
 
-`cp-authorization` token is captured from the user's browser DevTools and stored as `CLASSPASS_AUTH_TOKEN`. It is long-lived (weeks to months).
+`cp-authorization` token is captured manually from the user's browser DevTools and stored as `CLASSPASS_AUTH_TOKEN`. Long-lived (weeks to months). README has the capture steps under "Capturing your ClassPass auth token and user ID".
 
-On a 401, `book.py` calls `auth.refresh_token()` which logs in with `CLASSPASS_EMAIL` / `CLASSPASS_PASSWORD`. The exact login endpoint is `https://classpass.com/api/v2/auth/login` but the request body shape and response token field have not been captured (Chrome DevTools' service worker integration prevented capturing the body). `auth.py` has TODOs marking what needs to be confirmed.
+**There is no auto-refresh.** The login endpoint (`https://classpass.com/api/v2/auth/login`) is hidden behind a service worker that DevTools can't capture the body of, the token never lands in `localStorage` or visible cookies, and brute-forcing the payload shape gets rate-limited quickly. We investigated this in depth and concluded the manual rotation cost (once every few weeks/months) is much lower than the cost of a half-tested auto-refresh failing right before a popular class releases. If we ever revisit, mitmproxy in front of a logged-in browser would be the reliable capture path. Do not waste time poking at the login endpoint without that.
 
-In GitHub Actions, an in-memory refresh does not persist across runs. If the token frequently expires, we'd need to push the rotated token back to GitHub Secrets (requires a PAT with `secrets:write`).
+**Staleness detection.** `scheduler.main()` and `cancellation_poller.main()` call `fetch_credit_balance()` once at run start. A `None` return almost always means the token is stale (the balance endpoint requires auth; Cloudflare blips are rare). When that happens we email the user a "rotate CLASSPASS_AUTH_TOKEN" message and continue the run as a soft gate, so a one-off network blip doesn't halt the booker.
 
 ## Booking Window
 

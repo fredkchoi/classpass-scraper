@@ -27,10 +27,8 @@ cp .env.example .env
 | `SENDER_EMAIL` | Gmail address to send notifications from |
 | `SENDER_PASSWORD` | Gmail [App Password](https://myaccount.google.com/apppasswords) |
 | `RECIPIENT_EMAIL` | Email address to receive notifications |
-| `CLASSPASS_AUTH_TOKEN` | Auth token captured from DevTools (see below) |
+| `CLASSPASS_AUTH_TOKEN` | Auth token captured from DevTools (see below). Rotate manually when the bot emails you about a stale token |
 | `CLASSPASS_USER_ID` | Your ClassPass user ID (see below) |
-| `CLASSPASS_EMAIL` | (Optional) Account email for auto-refresh of the token |
-| `CLASSPASS_PASSWORD` | (Optional) Account password for auto-refresh |
 | `GOOGLE_CLIENT_ID` | (Optional) Google OAuth2 client ID for Calendar |
 | `GOOGLE_CLIENT_SECRET` | (Optional) |
 | `GOOGLE_REFRESH_TOKEN` | (Optional) Obtained once via the gcal setup flow |
@@ -47,7 +45,7 @@ ClassPass uses a Django-REST-Framework-style token in a `cp-authorization: Token
 4. Inspect the request headers. Copy the value after `Token ` from `cp-authorization` into `CLASSPASS_AUTH_TOKEN`
 5. The `_api/v1/users/<USER_ID>/...` path contains your numeric `CLASSPASS_USER_ID`
 
-If the token expires, the booker will email you and (if `CLASSPASS_EMAIL` + `CLASSPASS_PASSWORD` are set and the login endpoint in `auth.py` is wired up) attempt to refresh automatically.
+When the token eventually goes stale, the next hourly scheduler/cancellation-poller run will detect it (the credit-balance pre-check returns `None`) and email you. Repeat steps 1 to 5 and update the `CLASSPASS_AUTH_TOKEN` GitHub Secret. There is no auto-refresh: ClassPass's login endpoint is gated behind a service worker, so we can't replay it programmatically without something like mitmproxy intercepting the browser session, which isn't worth the setup for a token that rotates this rarely.
 
 ### Finding a venue ID
 
@@ -58,7 +56,7 @@ If the token expires, the booker will email you and (if `CLASSPASS_EMAIL` + `CLA
 ## How booking works
 
 1. **Search** — `POST /_api/v3/search/schedules` returns the list of classes at a venue for a given date, each with a `schedule.id` and dynamic `availability.credits` cost. ClassPass gates this endpoint behind Cloudflare bot detection, so the request needs a real user-agent, `platform: web`, and the `cp-authorization` token.
-2. **Balance check** — `GET /_api/v3/lifecycle/user/{user_id}/balance` returns `{"data": {"credit_balance": {"credits_remaining": N}}}`. The scheduler fetches this at the start of each target and skips preferences whose dynamic credit cost exceeds the balance (no point sleeping until release or POSTing a reservation that will fail).
+2. **Balance check** — `GET /_api/v3/lifecycle/user/{user_id}/balance` returns `{"data": {"credit_balance": {"credits_remaining": N}}}`. Fetched once at run start. Used for two things: (a) skipping preferences whose dynamic credit cost exceeds the balance, and (b) doubling as an auth health check, since a failed balance fetch almost always means the token is stale. On failure the bot emails you and continues the run as a soft gate.
 3. **Reserve** — `POST /_api/v1/users/{user_id}/reservations` with `{"schedule": <id>, "credits": <credits>}` and the `cp-authorization` token
 
 The booker re-fetches the search response right before reserving so it sends the current credit cost (ClassPass uses dynamic pricing). If the balance fetch itself fails the booker falls back to the previous behavior of attempting the reservation anyway.

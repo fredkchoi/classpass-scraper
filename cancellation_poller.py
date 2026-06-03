@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from notifier import send_email
 from availability import find_matches
-from scheduler import expand_preferences, _format_preferences_list, _book_pref
+from scheduler import expand_preferences, _format_preferences_list, _book_pref, _maybe_notify_token_stale
 
 TARGETS_FILE = os.path.join(os.path.dirname(__file__), "targets.json")
 BOOKING_URL_FMT = "https://classpass.com/classes/{schedule_id}"
@@ -75,7 +75,7 @@ def _email_open_matches(target_label: str, hits: list[tuple[int, dict, dict]], p
     send_email(subject=f"Cancellation available: ClassPass {target_label}", body=body)
 
 
-def process_polling_target(target: dict, has_token: bool) -> dict | None:
+def process_polling_target(target: dict, has_token: bool, balance: int | None) -> dict | None:
     """Return None if the target was booked or should be dropped, else the updated target."""
     prefs = expand_preferences(target)
     if not prefs:
@@ -85,15 +85,6 @@ def process_polling_target(target: dict, has_token: bool) -> dict | None:
         f"venue {prefs[0]['venue_id']} {prefs[0]['date']}"
     )
     print(f"\n=== {target_label} (polling) ===")
-
-    balance: int | None = None
-    if has_token:
-        from book import fetch_credit_balance
-        balance = fetch_credit_balance()
-        if balance is None:
-            print("Credit balance: unknown (won't filter by affordability)")
-        else:
-            print(f"Credit balance: {balance} credits")
 
     hits: list[tuple[int, dict, dict]] = []
     for i, p in enumerate(prefs):
@@ -146,6 +137,12 @@ def main():
         return
 
     has_token = bool(os.getenv("CLASSPASS_AUTH_TOKEN"))
+    balance: int | None = None
+    if has_token:
+        from book import fetch_credit_balance
+        balance = fetch_credit_balance()
+        _maybe_notify_token_stale(balance)
+
     non_polling = [t for t in targets if t.get("status") != "polling"]
     remaining_polling: list = []
 
@@ -153,7 +150,7 @@ def main():
         if _is_expired(target):
             print(f"Dropping expired polling target: {target.get('label') or target.get('date')}")
             continue
-        result = process_polling_target(target, has_token)
+        result = process_polling_target(target, has_token, balance)
         if result is not None:
             remaining_polling.append(result)
 
