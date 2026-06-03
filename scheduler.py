@@ -211,10 +211,15 @@ def _override_release_dt(target: dict, default_tz: str) -> datetime | None:
     return dt
 
 
-def process_target(target: dict) -> dict:
+def process_target(target: dict, run_start: datetime) -> dict:
     """
     Run the per-target decision loop. Returns the updated target dict (with
     `status: polling` if we need the cancellation poller to take over).
+
+    The 75-min wait window is measured from `run_start`, not from "now". This
+    means each hourly run only handles targets releasing within its own hour,
+    so the run is bounded in length (regardless of how many targets are in
+    targets.json) and the next hourly run cleanly picks up the next target.
     """
     label = f"venue {target['venue_id']} {target['date']} {target.get('time') or 'any'} {target.get('class_name_contains') or ''}".strip()
     print(f"\n=== {label} ===")
@@ -248,12 +253,13 @@ def process_target(target: dict) -> dict:
                   "Skipping; will retry next hour.")
             return target
 
-        now = datetime.now(release_dt.tzinfo)
-        delta = (release_dt - now).total_seconds() / 60
-        print(f"Release at {release_dt.isoformat()} ({delta:+.1f} min from now).")
+        # Measure delta from RUN START so multi-target hours stay bounded.
+        run_start_local = run_start.astimezone(release_dt.tzinfo)
+        delta = (release_dt - run_start_local).total_seconds() / 60
+        print(f"Release at {release_dt.isoformat()} ({delta:+.1f} min from run start).")
 
         if delta > WAIT_WINDOW_MINUTES:
-            print(f"More than {WAIT_WINDOW_MINUTES} min away; skipping this run.")
+            print(f"More than {WAIT_WINDOW_MINUTES} min from run start; skipping (next hourly run picks it up).")
             return target
 
         wait_until(release_dt)
@@ -288,9 +294,10 @@ def main():
 
     failed_or_updated = []
     booked_keys: set = set()
+    run_start = datetime.now(ZoneInfo("UTC"))
 
     for target in actionable:
-        result = process_target(target)
+        result = process_target(target, run_start)
         if result.get("_booked"):
             booked_keys.add((target["date"], target["venue_id"]))
         else:
