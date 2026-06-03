@@ -255,9 +255,22 @@ def _book_pref(target_label: str, pref: dict, index: int, total: int, prefs: lis
     return False
 
 
+def _is_affordable(cls: dict | None, balance: int | None) -> bool:
+    """A preference is affordable if balance is unknown, credits cost is unknown,
+    or credits cost <= balance. Conservative when info is missing (assumes yes)."""
+    if cls is None:
+        return False
+    credits_cost = cls.get("credits")
+    if balance is None or credits_cost is None:
+        return True
+    return credits_cost <= balance
+
+
 def process_target(target: dict, run_start: datetime) -> dict:
     """Run the per-target decision loop. Returns the updated target dict, or
     `{"_booked": True}` if any preference was successfully booked."""
+    from book import fetch_credit_balance
+
     prefs = expand_preferences(target)
     target_label = target.get("label") or (
         f"venue {prefs[0]['venue_id']} {prefs[0]['date']}" if prefs else "(empty target)"
@@ -266,28 +279,38 @@ def process_target(target: dict, run_start: datetime) -> dict:
     if not prefs:
         return target
 
+    balance = fetch_credit_balance()
+    if balance is None:
+        print("Credit balance: unknown (won't filter by affordability)")
+    else:
+        print(f"Credit balance: {balance} credits")
+
     # Match every preference once up front
     matched = []
     for i, p in enumerate(prefs):
         cls = _match_for_pref(p)
         matched.append((i, p, cls))
         if cls:
-            print(f"  [{i + 1}/{len(prefs)}] {p.get('time') or 'any'}: status={cls.get('status')} reason={cls.get('reason')}")
+            cost = cls.get("credits")
+            tag = "" if _is_affordable(cls, balance) else f" UNAFFORDABLE(cost={cost} > bal={balance})"
+            print(f"  [{i + 1}/{len(prefs)}] {p.get('time') or 'any'}: status={cls.get('status')} reason={cls.get('reason')} credits={cost}{tag}")
         else:
             print(f"  [{i + 1}/{len(prefs)}] {p.get('time') or 'any'}: no class found")
 
     # First pass: book any preference that's available right now, in priority order
     for i, p, cls in matched:
-        if cls and cls.get("status") == "available":
+        if cls and cls.get("status") == "available" and _is_affordable(cls, balance):
             print(f"Preference {i + 1} is available. Attempting to book.")
             if _book_pref(target_label, p, i + 1, len(prefs), prefs):
                 return {"_booked": True}
             print(f"Preference {i + 1} book failed, falling through to next.")
 
-    # Second pass: find earliest release time among prefs still pre-window
+    # Second pass: find earliest release time among affordable prefs still pre-window
     earliest_release: datetime | None = None
     for _i, p, cls in matched:
         if not cls or cls.get("reason") != "before_opening_window":
+            continue
+        if not _is_affordable(cls, balance):
             continue
         tz = cls.get("venue_tz", "America/New_York")
         rel = _override_release_dt(p, tz) or _parse_release_dt(cls.get("credits_reasons", []), tz)
@@ -297,7 +320,7 @@ def process_target(target: dict, run_start: datetime) -> dict:
     if earliest_release:
         run_start_local = run_start.astimezone(earliest_release.tzinfo)
         delta = (earliest_release - run_start_local).total_seconds() / 60
-        print(f"Earliest release across preferences: {earliest_release.isoformat()} ({delta:+.1f} min from run start).")
+        print(f"Earliest release across affordable preferences: {earliest_release.isoformat()} ({delta:+.1f} min from run start).")
 
         if delta > WAIT_WINDOW_MINUTES:
             print(f"More than {WAIT_WINDOW_MINUTES} min away; skipping (next hourly run picks it up).")
@@ -305,17 +328,22 @@ def process_target(target: dict, run_start: datetime) -> dict:
 
         wait_until(earliest_release)
 
-        # After release, re-attempt every preference in priority order
-        for i, p, _cls in matched:
+        # After release, re-attempt every affordable preference in priority order
+        for i, p, cls in matched:
+            if not _is_affordable(cls, balance):
+                continue
             if _book_pref(target_label, p, i + 1, len(prefs), prefs):
                 return {"_booked": True}
 
         print("No preference booked after release. Flagging target as polling.")
         return {**target, "status": "polling"}
 
-    # No release time found. If every preference is out_of_spots -> polling.
-    if matched and all(c and c.get("reason") == "out_of_spots" for _, _, c in matched):
-        print("All preferences are out of spots. Flagging target as polling.")
+    # No release time found. If every preference is out_of_spots OR unaffordable -> polling.
+    if matched and all(
+        c and (c.get("reason") == "out_of_spots" or not _is_affordable(c, balance))
+        for _, _, c in matched
+    ):
+        print("All preferences are out of spots or unaffordable. Flagging target as polling.")
         return {**target, "status": "polling"}
 
     # Mixed / unknown states (e.g. class not on schedule yet). Try again next hour.

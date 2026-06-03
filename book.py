@@ -19,6 +19,7 @@ from availability import find_matches
 from config import CLASSPASS_AUTH_TOKEN, CLASSPASS_USER_ID
 
 BASE_URL = "https://classpass.com"
+BALANCE_URL_FMT = BASE_URL + "/_api/v3/lifecycle/user/{user_id}/balance"
 
 # In-memory token (overridable at runtime if the env-var token expires)
 _token: str = CLASSPASS_AUTH_TOKEN
@@ -80,6 +81,51 @@ def reserve(schedule_id: int, credits: int) -> dict:
         print(f"[book] HTTP {resp.status_code}: {resp.text[:500]}")
     resp.raise_for_status()
     return resp.json()
+
+
+def _balance_once():
+    if not CLASSPASS_USER_ID:
+        raise ValueError("CLASSPASS_USER_ID is not set, required for balance check")
+    return requests.get(
+        BALANCE_URL_FMT.format(user_id=CLASSPASS_USER_ID),
+        headers=_headers(),
+        timeout=15,
+        impersonate="chrome",
+    )
+
+
+def fetch_credit_balance() -> int | None:
+    """
+    Returns the user's current ClassPass credit balance, or None if the request fails.
+    Retries once with a refreshed token on 401/403.
+    """
+    try:
+        resp = _balance_once()
+    except ValueError as e:
+        print(f"[book] balance: {e}")
+        return None
+
+    if resp.status_code in (401, 403):
+        print(f"[book] balance: got {resp.status_code}, attempting token refresh...")
+        try:
+            from auth import refresh_token
+            new_token = refresh_token()
+        except Exception as e:
+            print(f"[book] Token refresh raised: {e}")
+            new_token = ""
+        if new_token:
+            set_token(new_token)
+            resp = _balance_once()
+
+    if not resp.ok:
+        print(f"[book] balance HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    try:
+        return resp.json().get("data", {}).get("credit_balance", {}).get("credits_remaining")
+    except Exception as e:
+        print(f"[book] balance parse error: {e}")
+        return None
 
 
 def attempt_booking(

@@ -58,9 +58,10 @@ If the token expires, the booker will email you and (if `CLASSPASS_EMAIL` + `CLA
 ## How booking works
 
 1. **Search** — `POST /_api/v3/search/schedules` returns the list of classes at a venue for a given date, each with a `schedule.id` and dynamic `availability.credits` cost. ClassPass gates this endpoint behind Cloudflare bot detection, so the request needs a real user-agent, `platform: web`, and the `cp-authorization` token.
-2. **Reserve** — `POST /_api/v1/users/{user_id}/reservations` with `{"schedule": <id>, "credits": <credits>}` and the `cp-authorization` token
+2. **Balance check** — `GET /_api/v3/lifecycle/user/{user_id}/balance` returns `{"data": {"credit_balance": {"credits_remaining": N}}}`. The scheduler fetches this at the start of each target and skips preferences whose dynamic credit cost exceeds the balance (no point sleeping until release or POSTing a reservation that will fail).
+3. **Reserve** — `POST /_api/v1/users/{user_id}/reservations` with `{"schedule": <id>, "credits": <credits>}` and the `cp-authorization` token
 
-The booker re-fetches the search response right before reserving so it sends the current credit cost (ClassPass uses dynamic pricing).
+The booker re-fetches the search response right before reserving so it sends the current credit cost (ClassPass uses dynamic pricing). If the balance fetch itself fails the booker falls back to the previous behavior of attempting the reservation anyway.
 
 ## targets.json
 

@@ -86,6 +86,15 @@ def process_polling_target(target: dict, has_token: bool) -> dict | None:
     )
     print(f"\n=== {target_label} (polling) ===")
 
+    balance: int | None = None
+    if has_token:
+        from book import fetch_credit_balance
+        balance = fetch_credit_balance()
+        if balance is None:
+            print("Credit balance: unknown (won't filter by affordability)")
+        else:
+            print(f"Credit balance: {balance} credits")
+
     hits: list[tuple[int, dict, dict]] = []
     for i, p in enumerate(prefs):
         matches = find_matches(
@@ -109,13 +118,23 @@ def process_polling_target(target: dict, has_token: bool) -> dict | None:
         _email_open_matches(target_label, hits, prefs)
         return None  # drop after notifying
 
-    # Auto-book in priority order
-    for i, p, _m in hits:
+    # Auto-book in priority order, skipping anything we can't afford
+    any_unaffordable = False
+    for i, p, m in hits:
+        cost = m.get("credits")
+        if balance is not None and cost is not None and cost > balance:
+            print(f"  Preference {i + 1} unaffordable ({cost} > {balance}), skipping.")
+            any_unaffordable = True
+            continue
         if _book_pref(target_label, p, i + 1, len(prefs), prefs):
             return None  # booked, drop from polling
 
-    # All booking attempts failed; keep polling
-    print("All available preferences failed to book; keeping in polling state.")
+    # All booking attempts failed (or were unaffordable); keep polling so a credit
+    # refill or another cancellation can rescue the target on a later run.
+    msg = "Could not auto-book any preference"
+    if any_unaffordable:
+        msg += " (some were unaffordable)"
+    print(f"{msg}; keeping in polling state.")
     return target
 
 

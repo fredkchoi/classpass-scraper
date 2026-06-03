@@ -35,7 +35,8 @@ The booking job is triggered by a Cloudflare Worker cron (more reliable than GHA
 ## Booking Flow
 
 1. `POST /_api/v3/search/schedules` with `{date, venue: [<id>], ...}` returns class list with `schedule.id` and `availability.credits`
-2. `POST /_api/v1/users/{CLASSPASS_USER_ID}/reservations` with `{"schedule": <id>, "credits": <credits>}` and `cp-authorization: Token <CLASSPASS_AUTH_TOKEN>`
+2. `GET /_api/v3/lifecycle/user/{CLASSPASS_USER_ID}/balance` returns `{"data": {"credit_balance": {"credits_remaining": N}}}`. Fetched once at the start of each target's processing in `scheduler.py` and `cancellation_poller.py`; preferences whose `credits` cost exceeds the balance are dropped from the booking + sleep decision passes (logged as `UNAFFORDABLE`). If the balance fetch itself fails, no filtering is applied (fallback to letting the reservation endpoint reject)
+3. `POST /_api/v1/users/{CLASSPASS_USER_ID}/reservations` with `{"schedule": <id>, "credits": <credits>}` and `cp-authorization: Token <CLASSPASS_AUTH_TOKEN>`
 
 **Never hardcode credits**, they're dynamic. Always read `availability.credits` from a fresh search response and pass it into the reservation.
 
