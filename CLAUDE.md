@@ -29,7 +29,7 @@ The booking job is triggered by a Cloudflare Worker cron (more reliable than GHA
 | `validate_targets.py` | Schema linter for `targets.json` (run in CI on every push) |
 | `config.py` | Env var loading |
 | `notifier.py` | Email notifications via Gmail SMTP |
-| `cf-trigger/` | Cloudflare Worker that fires `repository_dispatch` on cron, primary trigger for `midnight-booker.yml` |
+| `cf-trigger/` | Cloudflare Worker that fires `repository_dispatch` on cron, primary trigger for `hourly-booker.yml` |
 
 ## Booking Flow
 
@@ -61,23 +61,24 @@ Whether ClassPass actually releases at midnight venue-local is empirical. If not
 
 ## Scheduling
 
-- **Cloudflare Worker** (primary): fires hourly at `0 * * * *` UTC and POSTs `repository_dispatch` with `event_type: midnight-booker` to GitHub.
+- **Cloudflare Worker** (primary): fires hourly at `0 * * * *` UTC and POSTs `repository_dispatch` with `event_type: hourly-booker` to GitHub.
 - **GHA `schedule:` cron** (backup): same hourly cadence, kept in case the CF Worker fails.
 - **Workflow `timeout-minutes: 150`** to accommodate the max in-process wait (75 min window + 5 min book retry buffer plus overhead).
 - **Workflow `concurrency:`** serializes runs. Prevents an in-flight sleeping run from racing the next hourly dispatch on the reservation endpoint.
 - **Booking semantics (`scheduler.py`)**:
   - Excludes polling targets (those are owned by `cancellation_poller.py`)
   - For each remaining target, expand into a priority-ordered list of preferences (via `expand_preferences`), then query the schedule API per preference
-  - If any preference is currently `available`, book in priority order
-  - Else find the earliest `before_opening_window` release time across all preferences. If within next 75 min, sleep until then, then try every preference in priority order. First successful book wins
-  - If all preferences are `out_of_spots` (or all booking attempts fail), the whole target moves to `status: polling`
-  - Failed bookings are written back to `targets.json` for the cancellation poller, which also iterates preferences in priority order
+  - If any preference is currently `available`, book in priority order using `_book_pref` (search + reserve each attempt, 2 s retry, 5 min cap)
+  - Else find the earliest `before_opening_window` release time across all preferences. If within next 75 min, sleep until then, then fire `_book_pref_fast` per preference (skips the per-attempt search by reusing the pre-window schedule_id; retries every `FAST_RETRY_SECONDS` = 0.15 s). The fast path matters because popular classes sell out in well under a second once the window opens
+  - If all preferences are `out_of_spots` (or all booking attempts fail), the whole target moves to `status: polling` and a "couldn't book" email is sent. Failed bookings get written back to `targets.json` for the cancellation poller, which also iterates preferences in priority order
+  - Reservation cost (credits) is dynamic and can be `None` pre-window. The fast path does one refresh at release to get fresh credits, falling back to `retail_price_in_credits` if still missing
+  - Successful book → confirmation email + optional GCal event via `_emit_booked_email_and_calendar`
 
 ## Workflows
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `midnight-booker.yml` | `repository_dispatch` (from CF Worker) + `schedule` (backup) + `workflow_dispatch` | Nightly booking attempt |
+| `hourly-booker.yml` | `repository_dispatch` (from CF Worker) + `schedule` (backup) + `workflow_dispatch` | Hourly booking attempt |
 | `cancellation-poller.yml` | `schedule` hourly | Watches polling targets; auto-books matching slots, email fallback if booking fails |
 | `monday-prompt.yml` | `schedule` Monday 9am ET | Weekly email reminder to confirm targets |
 | `validate-targets.yml` | Push/PR touching `targets.json` | Lints schema; blocks merge on failure |

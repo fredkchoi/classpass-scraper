@@ -14,7 +14,7 @@ export default {
           'Accept': 'application/vnd.github+json',
           'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
           'X-GitHub-Api-Version': '2022-11-28',
-          'User-Agent': 'cf-worker-midnight-booker',
+          'User-Agent': 'cf-worker-hourly-booker',
         },
         body: JSON.stringify({ event_type: env.DISPATCH_EVENT_TYPE }),
       },

@@ -1,10 +1,10 @@
 # cf-trigger
 
-A tiny Cloudflare Worker that fires a GitHub `repository_dispatch` event on a cron schedule. Part of [classpass-scraper](../README.md). Replaces GitHub Actions' built-in `schedule:` cron, which can be delayed 25 minutes to several hours on small repos (fatal for a job that must fire at midnight ET when the ClassPass 7-day booking window opens).
+A tiny Cloudflare Worker that fires a GitHub `repository_dispatch` event on a cron schedule. Part of [classpass-scraper](../README.md). Replaces GitHub Actions' built-in `schedule:` cron, which can be delayed 25 minutes to several hours on small repos (fatal for a booker that must fire at the exact moment the ClassPass booking window opens).
 
 ## How it works
 
-Cloudflare cron fires at `0 3 * * *` (03:00 UTC = 11:00pm EDT / 10:00pm EST), the Worker `POST`s to `https://api.github.com/repos/<owner>/<repo>/dispatches` with `{"event_type": "midnight-booker"}`, then the `midnight-booker.yml` workflow (configured with `on: repository_dispatch`) runs. The Python `scheduler.py` script wakes up, computes each target's exact venue-local window-open time, and sleeps until then before booking.
+Cloudflare cron fires every hour (`0 * * * *` UTC), the Worker `POST`s to `https://api.github.com/repos/<owner>/<repo>/dispatches` with `{"event_type": "hourly-booker"}`, then the `hourly-booker.yml` workflow (configured with `on: repository_dispatch`) runs. The Python `scheduler.py` script queries the ClassPass schedule API for each target, parses the release moment, and either books now, sleeps until the exact release moment within the hour, or skips (next hourly run picks it up).
 
 ## Setup
 
@@ -29,13 +29,9 @@ To manually fire the scheduled handler locally and confirm the GitHub dispatch w
 ```bash
 npx wrangler dev --test-scheduled
 # In a second terminal:
-curl "http://localhost:8787/__scheduled?cron=0+3+*+*+*"
+curl "http://localhost:8787/__scheduled?cron=0+*+*+*+*"
 # Then check the target repo:
-gh run list --workflow=midnight-booker.yml --limit 3
+gh run list --workflow=hourly-booker.yml --limit 3
 ```
 
-You should see a new run with `event = repository_dispatch`. The production Worker fires automatically at 03:00 UTC nightly.
-
-## Multi-timezone caveat
-
-The Worker fires once at 03:00 UTC, which corresponds to 11:00pm Eastern (EDT) or 10:00pm Eastern (EST). For non-Eastern venues, the workflow's `timeout-minutes: 150` gives enough headroom to sleep until that venue's local midnight. If you target venues in timezones west of Eastern that need a different fire time, add additional cron expressions to `wrangler.jsonc` or run multiple Workers.
+You should see a new run with `event = repository_dispatch`. The production Worker fires automatically every hour.

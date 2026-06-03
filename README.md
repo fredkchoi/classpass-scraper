@@ -123,11 +123,15 @@ python scheduler.py
 # Validates targets.json
 # For each target, queries the ClassPass schedule API and branches on what it sees:
 #   status="available"            -> book immediately
-#   reason="out_of_spots"         -> flag as polling for the cancellation watcher
+#   reason="out_of_spots"         -> flag as polling + email you
 #   reason="before_opening_window" -> parse release time from `credits_reasons`
 #                                     (e.g. "The booking window opens on 6/3/26, 5:00 AM"),
 #                                     sleep until exactly then if within 75 min,
-#                                     otherwise skip (next hourly run picks it up)
+#                                     then fire a tight reservation loop (~0.15 s between
+#                                     attempts, no per-attempt search call) for up to
+#                                     5 min per preference. If none book, flag as polling
+#                                     and email you. Otherwise skip (next hourly run
+#                                     picks it up).
 ```
 
 ## Cloud architecture
@@ -141,7 +145,7 @@ The booker workflow uses GHA `concurrency:` so only one run is in flight at a ti
 | Component | Trigger | What it does |
 |---|---|---|
 | `cf-trigger/` (Cloudflare Worker) | CF cron at `0 * * * *` (hourly) | Sends `repository_dispatch` to the GitHub repo |
-| `midnight-booker.yml` (GHA) | `repository_dispatch` + `schedule` hourly backup | Runs `scheduler.py`, which queries the API and books (or waits + books) |
+| `hourly-booker.yml` (GHA) | `repository_dispatch` + `schedule` hourly backup | Runs `scheduler.py`, which queries the API and books (or waits + books) |
 | `cancellation-poller.yml` (GHA) | Hourly | On polling targets: auto-books when matching classes open up (or emails if no auth token is set) |
 | `monday-prompt.yml` (GHA) | Every Monday ~9am ET | Emails upcoming booking windows for the next 2 weeks |
 | `validate-targets.yml` (GHA) | On `targets.json` push/PR | Lints the file, blocks merge if invalid |

@@ -13,7 +13,7 @@
     },
 	"vars": {
 		"GITHUB_REPO": "fredkchoi/classpass-scraper",
-		"DISPATCH_EVENT_TYPE": "midnight-booker"
+		"DISPATCH_EVENT_TYPE": "hourly-booker"
 	},
 	"observability": {
 		"enabled": true

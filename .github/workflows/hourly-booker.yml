@@ -1,26 +1,22 @@
-name: Booker
+name: Hourly Booker
 
-# Triggered hourly by the cf-trigger Cloudflare Worker. The scheduler queries the
-# ClassPass schedule API to decide whether to book now, wait until the release
-# moment within this hour, or flag the target for cancellation polling.
+# Fires every hour via the cf-trigger Cloudflare Worker (primary) and a GHA
+# schedule cron (backup). The scheduler queries the ClassPass schedule API to
+# decide whether to book now, sleep until the release moment within this hour,
+# or flag the target for cancellation polling.
 
 on:
-  # Primary trigger: Cloudflare Worker (`cf-trigger/`) fires `repository_dispatch`
-  # every hour. CF crons are reliable to within a minute; GHA `schedule:` crons
-  # can be delayed 25min to several hours on small repos.
   repository_dispatch:
-    types: [midnight-booker]
-  # Backup trigger in case the CF Worker fails. Same hourly cadence.
-  # Keep until the Worker path has proven reliable for several weeks.
+    # Accept both names during the rename cutover. Remove `midnight-booker`
+    # after the CF Worker is redeployed with DISPATCH_EVENT_TYPE=hourly-booker.
+    types: [hourly-booker, midnight-booker]
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
 
 # Serialize runs. A run that's sleeping until a release moment can be still
 # in-flight when the next hourly cron fires; without this, the new run would
-# race the sleeping one and both try to book. With concurrency, the second
-# run queues, then starts after the first commits its targets.json update,
-# at which point the booked target is gone and the second run is a no-op.
+# race the sleeping one and both try to book.
 concurrency:
   group: classpass-booker
   cancel-in-progress: false
@@ -28,19 +24,21 @@ concurrency:
 jobs:
   book:
     runs-on: ubuntu-latest
-    # 150min accommodates the EST winter case: workflow fires at 10pm EST and
-    # sleeps ~2hr until venue-local midnight before booking.
     timeout-minutes: 150
     permissions:
       contents: write
     steps:
+      # `ref: master` (not the trigger SHA) so a queued run sees commits the
+      # earlier in-flight run pushed while we were waiting on the concurrency lock.
       - uses: actions/checkout@v6
+        with:
+          ref: master
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
       - name: Attempt booking
-        run: python scheduler.py
+        run: python -u scheduler.py
         env:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
@@ -57,4 +55,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add targets.json
-          git diff --staged --quiet || (git commit -m "chore: update targets after booking attempt" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update targets after booking attempt"
+            # Rebase on the latest master before push to absorb commits another
+            # run may have pushed while we were sleeping; retry once on race.
+            git pull --rebase origin master || true
+            git push || (git pull --rebase origin master && git push)
+          fi

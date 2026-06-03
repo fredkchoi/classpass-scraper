@@ -32,6 +32,9 @@ from availability import find_matches
 TARGETS_FILE = os.path.join(os.path.dirname(__file__), "targets.json")
 WAIT_WINDOW_MINUTES = 75
 BOOK_RETRY_MINUTES = 5
+# Tight retry interval for the release-moment fast reserve loop. Popular classes
+# sell out in well under a second; we want to maximize attempts per second.
+FAST_RETRY_SECONDS = 0.15
 RELEASE_REGEX = re.compile(
     r"(\d{1,2})/(\d{1,2})/(\d{2,4}),\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
     re.IGNORECASE,
@@ -255,6 +258,119 @@ def _book_pref(target_label: str, pref: dict, index: int, total: int, prefs: lis
     return False
 
 
+def _emit_booked_email_and_calendar(target_label, pref, fresh_match, credits, index, total, prefs):
+    """Side-effects after a successful reservation: notification email + GCal event."""
+    start = fresh_match.get("start_time")
+    body = (
+        f"Booked {fresh_match.get('class_name', 'a class')} on {pref['date']}!\n\n"
+        f"  - Venue: {fresh_match.get('venue_name')}\n"
+        f"  - Time: {start.strftime('%I:%M %p %Z') if start else pref['date']}\n"
+        f"  - Teacher: {fresh_match.get('teacher_name')}\n"
+        f"  - Cost: {credits} credits\n\n"
+        f"Booked preference {index} of {total} from your priority list:\n"
+        f"{_format_preferences_list(prefs)}\n\n"
+        "- Your ClassPass Bot"
+    )
+    print(body)
+    send_email(subject=f"Booked: ClassPass {pref['date']}", body=body)
+
+    if start and os.getenv("GOOGLE_REFRESH_TOKEN"):
+        try:
+            from gcal import create_booking_event
+            duration = fresh_match.get("duration_minutes") or 50
+            end = start + timedelta(minutes=duration)
+            create_booking_event(
+                start_dt=start,
+                end_dt=end,
+                summary=f"{fresh_match.get('class_name')} @ {fresh_match.get('venue_name')}",
+                location_name=fresh_match.get("venue_name", ""),
+                tz_name=fresh_match.get("venue_tz", "America/New_York"),
+            )
+        except Exception as e:
+            print(f"[gcal] Skipping calendar event: {e}")
+
+
+def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, total: int,
+                    prefs: list[dict], balance: int | None) -> bool:
+    """
+    Release-moment booker. Skips the per-attempt search round-trip used by
+    `_book_pref` by reusing the schedule_id from the pre-window match, and
+    spins reservation POSTs at FAST_RETRY_SECONDS instead of 2s. One up-front
+    search refreshes the dynamic credit cost (pre-window the API returns None).
+    Falls back to retail_price_in_credits when even the post-release search
+    hasn't populated credits yet.
+    """
+    from book import reserve
+
+    schedule_id = pre_match.get("schedule_id")
+    if not schedule_id:
+        return False
+
+    # One refresh to pin current credits cost. Pre-window matches always have
+    # credits=None; at/after release the API populates it.
+    fresh = _match_for_pref(pref) or pre_match
+    credits = (
+        fresh.get("credits")
+        or fresh.get("retail_price_in_credits")
+        or pre_match.get("retail_price_in_credits")
+    )
+    if not credits:
+        print(f"  pref {index}: no credit cost available, skipping")
+        return False
+
+    max_c = pref.get("max_credits")
+    if max_c is not None and credits > max_c:
+        print(f"  pref {index}: cost {credits} > cap {max_c}, skipping")
+        return False
+    if balance is not None and credits > balance:
+        print(f"  pref {index}: cost {credits} > balance {balance}, skipping")
+        return False
+
+    pref_label = f"[{index}/{total}] {pref.get('time') or 'any'}"
+    print(f"[{target_label}] {pref_label} firing reserve loop (schedule={schedule_id}, credits={credits})")
+    deadline = datetime.now() + timedelta(minutes=BOOK_RETRY_MINUTES)
+    attempt = 0
+    while datetime.now() < deadline:
+        attempt += 1
+        try:
+            reserve(schedule_id, credits)
+        except Exception as e:
+            msg = str(e)[:300].lower()
+            # Hard-fail for unrecoverable signals to free up time for next preference
+            if any(s in msg for s in (
+                "out_of_spots", "no_spots", "no spot", "full", "sold out",
+                "already_booked", "already reserved", "already_reserved",
+            )):
+                print(f"  attempt {attempt}: {msg}; moving to next preference")
+                return False
+            # Quiet log for the common HTTP 4xx case (window-not-open retries)
+            if attempt == 1 or attempt % 20 == 0:
+                print(f"  attempt {attempt}: {msg}")
+            time.sleep(FAST_RETRY_SECONDS)
+            continue
+
+        _emit_booked_email_and_calendar(target_label, pref, fresh, credits, index, total, prefs)
+        return True
+
+    print(f"  {pref_label} exhausted {BOOK_RETRY_MINUTES} min")
+    return False
+
+
+def _notify_target_moved_to_polling(target_label: str, prefs: list[dict], reason: str):
+    body = (
+        f"Could not auto-book {target_label} during this run.\n\n"
+        f"Reason: {reason}\n\n"
+        f"Preferences attempted (priority order):\n"
+        f"{_format_preferences_list(prefs)}\n\n"
+        "The target is now in polling mode. The cancellation poller will keep "
+        "checking hourly in case a spot opens up. To book manually, sign in at "
+        "https://classpass.com/.\n\n"
+        "- Your ClassPass Bot"
+    )
+    print(body)
+    send_email(subject=f"ClassPass: couldn't book {target_label}", body=body)
+
+
 def _is_affordable(cls: dict | None, balance: int | None) -> bool:
     """A preference is affordable if balance is unknown, credits cost is unknown,
     or credits cost <= balance. Conservative when info is missing (assumes yes)."""
@@ -320,14 +436,19 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
 
         wait_until(earliest_release)
 
-        # After release, re-attempt every affordable preference in priority order
+        # After release, fire tight reservation loops in priority order. Uses the
+        # pre-resolved schedule_id from `matched` to skip a per-attempt search.
         for i, p, cls in matched:
             if not _is_affordable(cls, balance):
                 continue
-            if _book_pref(target_label, p, i + 1, len(prefs), prefs):
+            if _book_pref_fast(target_label, p, cls, i + 1, len(prefs), prefs, balance):
                 return {"_booked": True}
 
         print("No preference booked after release. Flagging target as polling.")
+        _notify_target_moved_to_polling(
+            target_label, prefs,
+            "Release window opened but no preference could be reserved (likely sold out within milliseconds).",
+        )
         return {**target, "status": "polling"}
 
     # No release time found. If every preference is out_of_spots OR unaffordable -> polling.
@@ -336,6 +457,10 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
         for _, _, c in matched
     ):
         print("All preferences are out of spots or unaffordable. Flagging target as polling.")
+        _notify_target_moved_to_polling(
+            target_label, prefs,
+            "All preferences were out_of_spots or unaffordable when the run started.",
+        )
         return {**target, "status": "polling"}
 
     # Mixed / unknown states (e.g. class not on schedule yet). Try again next hour.
