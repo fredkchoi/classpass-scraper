@@ -98,6 +98,7 @@ def normalize(schedule: dict) -> dict:
         "status": avail.get("status"),
         "credits": avail.get("credits"),
         "reason": avail.get("reason"),
+        "credits_reasons": avail.get("credits_reasons", []),
         "retail_price_in_credits": schedule.get("retail_price_in_credits"),
     }
 

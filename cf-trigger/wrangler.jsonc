@@ -9,7 +9,7 @@
 	"compatibility_date": "2026-05-12",
 	"workers_dev": false,
 	"triggers": {
-      "crons": ["0 3 * * *"]
+      "crons": ["0 * * * *"]
     },
 	"vars": {
 		"GITHUB_REPO": "fredkchoi/classpass-scraper",

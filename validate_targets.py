@@ -18,7 +18,7 @@ KNOWN_FIELDS = {
     "class_name_contains",
     "teacher_contains",
     "max_credits",
-    "lead_days",
+    "release_at",
     "status",
 }
 VALID_STATUSES = {"polling"}
@@ -103,10 +103,13 @@ def validate(data: dict) -> tuple[list[str], list[str]]:
                     f"{prefix}: time '{time_str}' must be HH:MM (24hr, e.g. '07:30')"
                 )
 
-        # lead_days
-        ld = t.get("lead_days")
-        if ld is not None and (not isinstance(ld, int) or ld < 1 or ld > 30):
-            errors.append(f"{prefix}: 'lead_days' must be an integer between 1 and 30 (got {ld!r})")
+        # release_at (optional manual override of the API-derived release time)
+        ra = t.get("release_at")
+        if ra is not None:
+            try:
+                datetime.fromisoformat(ra)
+            except (TypeError, ValueError):
+                errors.append(f"{prefix}: 'release_at' must be an ISO datetime string (got {ra!r})")
 
         # max_credits
         mc = t.get("max_credits")

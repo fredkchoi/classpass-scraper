@@ -83,7 +83,7 @@ Pre-populate this with everything you want to book — the scheduler picks up en
 | `class_name_contains` | no | Case-insensitive substring match on the class name |
 | `teacher_contains` | no | Case-insensitive substring match on the teacher name |
 | `max_credits` | no | Refuse to book if the class costs more than this (dynamic pricing safety cap) |
-| `lead_days` | no | Override the default 7-day booking window |
+| `release_at` | no | ISO datetime override for when the booking window opens (e.g. `"2026-06-03T05:00:00"`). Normally inferred from the API; only set this if the API message format changes or you want to test |
 | `status` | auto | Set to `"polling"` by the booker when an initial attempt fails |
 
 After each successful booking the target is removed automatically; failed targets are converted to polling entries for the cancellation poller.
@@ -103,23 +103,31 @@ python monday_prompt.py
 # Or just edit targets.json directly
 ```
 
-### Nightly scheduler
+### Hourly scheduler
 ```bash
 python scheduler.py
 # Validates targets.json
-# Already-open targets: books immediately
-# Tonight's targets: waits until venue-local midnight, then books
-# Failed bookings: flagged as "polling" for the cancellation poller
+# For each target, queries the ClassPass schedule API and branches on what it sees:
+#   status="available"            -> book immediately
+#   reason="out_of_spots"         -> flag as polling for the cancellation watcher
+#   reason="before_opening_window" -> parse release time from `credits_reasons`
+#                                     (e.g. "The booking window opens on 6/3/26, 5:00 AM"),
+#                                     sleep until exactly then if within 75 min,
+#                                     otherwise skip (next hourly run picks it up)
 ```
 
 ## Cloud architecture
 
-Everything runs in the cloud, your PC can stay off. The midnight booker is triggered by a Cloudflare Worker on a tight cron, because GitHub Actions' built-in `schedule:` cron can be delayed by hours on small repos (fatal at midnight when popular classes sell out in seconds).
+Everything runs in the cloud, your PC can stay off. Booking is triggered by a Cloudflare Worker on an hourly cron, because GitHub Actions' built-in `schedule:` cron can be delayed by hours on small repos (fatal when popular classes sell out in seconds at the exact release moment).
+
+The CF Worker fires every hour; each fire runs a short GHA job that queries the schedule API and either acts now or waits until the precise release moment within that hour. No per-studio configuration is needed: the API itself tells us when each class opens.
+
+The booker workflow uses GHA `concurrency:` so only one run is in flight at a time. If a run is sleeping until a release moment within the hour and the next hourly CF dispatch arrives, the new run queues until the sleeping run commits + finishes, then starts against the post-booking state and exits as a no-op. Prevents the in-flight run from racing the queued run on the reservation endpoint.
 
 | Component | Trigger | What it does |
 |---|---|---|
-| `cf-trigger/` (Cloudflare Worker) | CF cron at 03:00 UTC | Sends `repository_dispatch` to the GitHub repo |
-| `midnight-booker.yml` (GHA) | `repository_dispatch` + `schedule` backup | Runs `scheduler.py`, waits until each target's venue-local midnight, books |
+| `cf-trigger/` (Cloudflare Worker) | CF cron at `0 * * * *` (hourly) | Sends `repository_dispatch` to the GitHub repo |
+| `midnight-booker.yml` (GHA) | `repository_dispatch` + `schedule` hourly backup | Runs `scheduler.py`, which queries the API and books (or waits + books) |
 | `cancellation-poller.yml` (GHA) | Hourly | On polling targets: auto-books when matching classes open up (or emails if no auth token is set) |
 | `monday-prompt.yml` (GHA) | Every Monday ~9am ET | Emails upcoming booking windows for the next 2 weeks |
 | `validate-targets.yml` (GHA) | On `targets.json` push/PR | Lints the file, blocks merge if invalid |
@@ -140,7 +148,7 @@ Checks:
 - `venue_id` is an integer
 - `date` is `YYYY-MM-DD` and in the future
 - `time` (if set) is `HH:MM` 24hr
-- `lead_days` is between 1 and 30
+- `release_at` (if set) is a valid ISO datetime
 - `max_credits` is a positive integer
 - No duplicate targets (same venue + date + time + class filter)
 - No unknown fields

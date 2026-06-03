@@ -13,13 +13,13 @@ Python automation for booking ClassPass sessions across multiple venues. Runs en
 - venue-local timezones (booking window opens at midnight venue-local, not always ET)
 - ClassPass dynamic credit pricing (the cost is re-fetched right before booking)
 
-The booking job is triggered by a Cloudflare Worker cron (more reliable than GHA's native scheduler) which fires a GitHub `repository_dispatch` event; GitHub Actions does the actual Python work. A GHA `schedule:` cron at the same time remains as a backup.
+The booking job is triggered by a Cloudflare Worker cron (more reliable than GHA's native scheduler) which fires a GitHub `repository_dispatch` event every hour; GitHub Actions does the actual Python work. A GHA `schedule:` cron at the same cadence remains as a backup. The scheduler is API-driven: it queries the schedule endpoint for each target to find the exact release time and branches on `availability.status` + `availability.reason`. No per-studio rules are baked into the code.
 
 ## Key Files
 
 | File | Purpose |
 |---|---|
-| `scheduler.py` | Main nightly runner. Computes each target's window-open time in venue-local tz, waits, books |
+| `scheduler.py` | Hourly runner. Queries the schedule API per target, branches on `availability.status`/`reason`. Books immediately if `available`, polls if `out_of_spots`, parses `credits_reasons` for the release moment if `before_opening_window` and waits until then if within 75 min |
 | `book.py` | Booking logic: `POST /_api/v1/users/{user_id}/reservations` with `{schedule, credits}` + retry-on-401 |
 | `auth.py` | Email/password login to refresh `CLASSPASS_AUTH_TOKEN`. **Login endpoint is currently a stub**, needs the actual login request captured from DevTools to be wired in |
 | `availability.py` | `POST /_api/v3/search/schedules` via `curl_cffi` (impersonates Chrome's TLS handshake to defeat Cloudflare bot detection) |
@@ -61,13 +61,16 @@ Whether ClassPass actually releases at midnight venue-local is empirical. If not
 
 ## Scheduling
 
-- **Cloudflare Worker** (primary): fires at `0 3 * * *` UTC (= 11pm EDT / 10pm EST) and POSTs `repository_dispatch` with `event_type: midnight-booker` to GitHub.
-- **GHA `schedule:` cron** (backup): same `0 3 * * *` slot, kept in case the CF Worker fails.
-- **Workflow `timeout-minutes: 150`** to accommodate EST winter case where the workflow fires at 10pm EST and sleeps ~2hr until venue-local midnight.
+- **Cloudflare Worker** (primary): fires hourly at `0 * * * *` UTC and POSTs `repository_dispatch` with `event_type: midnight-booker` to GitHub.
+- **GHA `schedule:` cron** (backup): same hourly cadence, kept in case the CF Worker fails.
+- **Workflow `timeout-minutes: 150`** to accommodate the max in-process wait (75 min window + 5 min book retry buffer plus overhead).
+- **Workflow `concurrency:`** serializes runs. Prevents an in-flight sleeping run from racing the next hourly dispatch on the reservation endpoint.
 - **Booking semantics (`scheduler.py`)**:
   - Excludes polling targets (those are owned by `cancellation_poller.py`)
-  - Targets whose window opens in the next 6 hours: wait until exact open time, then book
-  - Targets already open (window already passed): book immediately
+  - For each remaining target: query the schedule API, branch on `availability.status` + `availability.reason`
+  - `available` -> book immediately with up to 5 min of retries
+  - `out_of_spots` -> flag as `status: polling`
+  - `before_opening_window` -> parse `availability.credits_reasons` for the release datetime (or use the `release_at` override on the target). If within next 75 min, sleep until that exact moment then book. Otherwise skip (next hourly run picks it up).
   - Failed bookings: written back to `targets.json` with `"status": "polling"`
 
 ## Workflows

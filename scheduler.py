@@ -1,27 +1,44 @@
 """
-Nightly runner. Validates targets, then books at the moment the booking window opens.
+Hourly runner triggered by the cf-trigger Cloudflare Worker.
 
-Triggered by GitHub Actions; can also be run manually. Flow:
-  1. Load and validate targets.json. Email errors and exit if invalid.
-  2. For each target, determine when its booking window opens (default: 7 days
-     before the class date at midnight in the venue's local timezone).
-  3. Targets that opened earlier (i.e. window is already live): try immediately.
-  4. Targets opening tonight: wait until midnight venue-local, then book.
-  5. On success, drop the target from targets.json. On failure, flag it as
-     "polling" so cancellation_poller.py keeps watching.
+For each non-polling target, this script:
+  1. Queries the ClassPass schedule API to find the matching class
+  2. Branches on availability.status + availability.reason:
+       - status="available" -> book immediately
+       - reason="out_of_spots" -> flag as polling for the cancellation poller
+       - reason="before_opening_window" -> parse the release time from
+         availability.credits_reasons (e.g. "The booking window opens on
+         6/4/26, 5:00 AM"), wait until then if within the next ~75 min,
+         otherwise skip (the next hourly run picks it up)
+  3. Targets whose class isn't yet on the schedule (search returns nothing)
+     are skipped silently and retried next hour.
+
+The optional `release_at` field on a target overrides whatever the API says,
+useful when ClassPass formats the message differently or you want to test.
 """
+
+from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from notifier import send_email
-from availability import fetch_schedule
+from availability import fetch_schedule, find_matches, normalize
 
 TARGETS_FILE = os.path.join(os.path.dirname(__file__), "targets.json")
-DEFAULT_LEAD_DAYS = 7
+# Maximum lookahead per run. With hourly cron + 75min lookahead we always have
+# at least one run that catches the release moment, even with cron drift.
+WAIT_WINDOW_MINUTES = 75
+# After the release time arrives, retry book this long before giving up.
+BOOK_RETRY_MINUTES = 5
+RELEASE_REGEX = re.compile(
+    r"(\d{1,2})/(\d{1,2})/(\d{2,4}),\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
+    re.IGNORECASE,
+)
 
 
 def load_targets() -> list:
@@ -37,7 +54,7 @@ def save_targets(targets: list):
 
 
 def validate_targets(targets: list) -> list:
-    """Return a list of human-readable error strings. Empty list means all targets valid."""
+    """Return a list of human-readable error strings. Empty means all valid."""
     errors = []
     for i, t in enumerate(targets):
         prefix = f"Target {i + 1}"
@@ -71,41 +88,60 @@ def validate_targets(targets: list) -> list:
     return errors
 
 
-def _venue_tz(venue_id: int, date_str: str) -> ZoneInfo:
-    """Look up the venue's timezone from a search response. Falls back to UTC on failure."""
-    schedules = fetch_schedule(venue_id, date_str)
-    for s in schedules:
-        tz = s.get("venue", {}).get("tz")
-        if tz:
-            return ZoneInfo(tz)
-    return ZoneInfo("UTC")
+def _parse_release_dt(credits_reasons: list, venue_tz: str) -> datetime | None:
+    """
+    Extract a tz-aware datetime from a ClassPass `credits_reasons` message like
+    'The booking window opens on 6/4/26, 5:00 AM'. Returns None if no match.
+    """
+    for msg in credits_reasons or []:
+        m = RELEASE_REGEX.search(msg)
+        if not m:
+            continue
+        month, day, year, hour, minute, ampm = m.groups()
+        year_int = int(year)
+        if year_int < 100:
+            year_int += 2000
+        hour_int = int(hour) % 12
+        if ampm.upper() == "PM":
+            hour_int += 12
+        try:
+            return datetime(
+                year_int, int(month), int(day),
+                hour_int, int(minute), 0,
+                tzinfo=ZoneInfo(venue_tz),
+            )
+        except (ValueError, OverflowError):
+            return None
+    return None
 
 
-def _window_open_dt(target: dict) -> datetime:
-    """Return the timezone-aware datetime at which this target's booking window opens."""
-    lead_days = target.get("lead_days", DEFAULT_LEAD_DAYS)
-    tz = _venue_tz(target["venue_id"], target["date"])
-    class_date = date.fromisoformat(target["date"])
-    open_date = class_date - timedelta(days=lead_days)
-    return datetime(open_date.year, open_date.month, open_date.day, 0, 0, 0, tzinfo=tz)
+def _match_for_target(target: dict) -> dict | None:
+    """Return the first matching class for this target, or None if no match yet."""
+    matches = find_matches(
+        venue_id=target["venue_id"],
+        date_str=target["date"],
+        time_str=target.get("time"),
+        class_name_contains=target.get("class_name_contains"),
+        teacher_contains=target.get("teacher_contains"),
+        only_available=False,
+    )
+    return matches[0] if matches else None
 
 
-def _now(tz: ZoneInfo) -> datetime:
-    return datetime.now(tz)
+def wait_until(target_dt: datetime):
+    now = datetime.now(target_dt.tzinfo)
+    sleep_secs = (target_dt - now).total_seconds()
+    if sleep_secs > 0:
+        print(f"Waiting {sleep_secs:.0f}s ({sleep_secs / 60:.1f} min) until {target_dt.isoformat()}...")
+        time.sleep(sleep_secs)
+    else:
+        print(f"Already past {target_dt.isoformat()}, proceeding immediately.")
 
 
-def book_target(target: dict) -> bool:
-    """Attempt to book one target. Retries for up to 5 minutes on transient errors."""
+def _book_with_retries(target: dict, label: str) -> bool:
+    """Retry book.attempt_booking for up to BOOK_RETRY_MINUTES."""
     from book import attempt_booking
-    venue_id = target["venue_id"]
-    date_str = target["date"]
-    time_str = target.get("time")
-    name_filter = target.get("class_name_contains")
-    teacher_filter = target.get("teacher_contains")
-    max_credits = target.get("max_credits")
-
-    label = f"venue {venue_id} {date_str} {time_str or 'any time'} {name_filter or 'any class'}".strip()
-    deadline = datetime.now() + timedelta(minutes=5)
+    deadline = datetime.now() + timedelta(minutes=BOOK_RETRY_MINUTES)
     attempt = 0
 
     while datetime.now() < deadline:
@@ -113,31 +149,31 @@ def book_target(target: dict) -> bool:
         print(f"[Attempt {attempt}] Booking {label}...")
         try:
             result = attempt_booking(
-                venue_id=venue_id,
-                date_str=date_str,
-                time_str=time_str,
-                class_name_contains=name_filter,
-                teacher_contains=teacher_filter,
-                max_credits=max_credits,
+                venue_id=target["venue_id"],
+                date_str=target["date"],
+                time_str=target.get("time"),
+                class_name_contains=target.get("class_name_contains"),
+                teacher_contains=target.get("teacher_contains"),
+                max_credits=target.get("max_credits"),
             )
         except Exception as e:
             print(f"[Attempt {attempt}] Error: {e}")
-            time.sleep(10)
+            time.sleep(5)
             continue
 
         if result:
             m = result.get("_match", {})
             start = m.get("start_time")
             body = (
-                f"Booked {m.get('class_name', 'a class')} on {date_str}!\n\n"
-                f"  • Venue: {m.get('venue_name')}\n"
-                f"  • Time: {start.strftime('%I:%M %p %Z') if start else date_str}\n"
-                f"  • Teacher: {m.get('teacher_name')}\n"
-                f"  • Cost: {m.get('credits')} credits\n\n"
-                "— Your ClassPass Bot"
+                f"Booked {m.get('class_name', 'a class')} on {target['date']}!\n\n"
+                f"  - Venue: {m.get('venue_name')}\n"
+                f"  - Time: {start.strftime('%I:%M %p %Z') if start else target['date']}\n"
+                f"  - Teacher: {m.get('teacher_name')}\n"
+                f"  - Cost: {m.get('credits')} credits\n\n"
+                "- Your ClassPass Bot"
             )
             print(body)
-            send_email(subject=f"Booked: ClassPass {date_str}", body=body)
+            send_email(subject=f"Booked: ClassPass {target['date']}", body=body)
 
             if start and os.getenv("GOOGLE_REFRESH_TOKEN"):
                 try:
@@ -155,21 +191,79 @@ def book_target(target: dict) -> bool:
                     print(f"[gcal] Skipping calendar event: {e}")
 
             return True
-        time.sleep(5)
+        time.sleep(3)
 
-    body = f"Failed to book ClassPass: {label} after 5 minutes of retries.\n\n— Your ClassPass Bot"
-    print(body)
-    send_email(subject=f"FAILED: ClassPass booking {date_str}", body=body)
     return False
 
 
-def wait_until(target_dt: datetime):
-    sleep_secs = (target_dt - datetime.now(target_dt.tzinfo)).total_seconds()
-    if sleep_secs > 0:
-        print(f"Waiting {sleep_secs:.0f}s ({sleep_secs / 60:.1f} min) until {target_dt.isoformat()}...")
-        time.sleep(sleep_secs)
-    else:
-        print(f"Window already open ({target_dt.isoformat()}) — proceeding immediately.")
+def _override_release_dt(target: dict, default_tz: str) -> datetime | None:
+    """If target has a `release_at` field, parse it as a tz-aware datetime."""
+    raw = target.get("release_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        print(f"[scheduler] Could not parse release_at '{raw}' for target {target.get('date')}")
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(default_tz))
+    return dt
+
+
+def process_target(target: dict) -> dict:
+    """
+    Run the per-target decision loop. Returns the updated target dict (with
+    `status: polling` if we need the cancellation poller to take over).
+    """
+    label = f"venue {target['venue_id']} {target['date']} {target.get('time') or 'any'} {target.get('class_name_contains') or ''}".strip()
+    print(f"\n=== {label} ===")
+
+    cls = _match_for_target(target)
+    if not cls:
+        print("No matching class on the schedule yet (might appear closer to the date).")
+        return target
+
+    venue_tz = cls.get("venue_tz", "America/New_York")
+    status = cls.get("status")
+    reason = cls.get("reason")
+
+    if status == "available":
+        print(f"Class is available right now. Booking immediately.")
+        if _book_with_retries(target, label):
+            return {"_booked": True}
+        print("Book failed, flagging as polling.")
+        return {**target, "status": "polling"}
+
+    if reason == "out_of_spots":
+        print("Class is full. Flagging as polling for cancellation watcher.")
+        return {**target, "status": "polling"}
+
+    if reason == "before_opening_window":
+        release_dt = _override_release_dt(target, venue_tz) or _parse_release_dt(
+            cls.get("credits_reasons", []), venue_tz
+        )
+        if not release_dt:
+            print(f"Release time unknown (credits_reasons={cls.get('credits_reasons')}). "
+                  "Skipping; will retry next hour.")
+            return target
+
+        now = datetime.now(release_dt.tzinfo)
+        delta = (release_dt - now).total_seconds() / 60
+        print(f"Release at {release_dt.isoformat()} ({delta:+.1f} min from now).")
+
+        if delta > WAIT_WINDOW_MINUTES:
+            print(f"More than {WAIT_WINDOW_MINUTES} min away; skipping this run.")
+            return target
+
+        wait_until(release_dt)
+        if _book_with_retries(target, label):
+            return {"_booked": True}
+        print("Book failed after window opened; flagging as polling.")
+        return {**target, "status": "polling"}
+
+    print(f"Unhandled state: status={status} reason={reason}; skipping.")
+    return target
 
 
 def main():
@@ -177,8 +271,8 @@ def main():
 
     errors = validate_targets(targets)
     if errors:
-        body = "targets.json has validation errors:\n\n" + "\n".join(f"  • {e}" for e in errors)
-        body += "\n\n— Your ClassPass Bot"
+        body = "targets.json has validation errors:\n\n" + "\n".join(f"  - {e}" for e in errors)
+        body += "\n\n- Your ClassPass Bot"
         print(body)
         send_email(subject="ClassPass: targets.json has errors", body=body)
         return
@@ -187,46 +281,27 @@ def main():
         print("No targets to process.")
         return
 
-    enriched = []
-    for t in targets:
-        if t.get("status") == "polling":
-            continue
-        try:
-            open_dt = _window_open_dt(t)
-            enriched.append((t, open_dt))
-        except Exception as e:
-            print(f"Error computing window for {t}: {e}")
-
-    if not enriched:
-        print("No actionable targets tonight.")
+    actionable = [t for t in targets if t.get("status") != "polling"]
+    if not actionable:
+        print("No actionable targets (all are in polling state).")
         return
 
-    # Anything that should fire within the next 6 hours counts as "tonight".
-    now_utc = datetime.now(ZoneInfo("UTC"))
-    cutoff = now_utc + timedelta(hours=6)
-    tonight = [(t, dt) for t, dt in enriched if now_utc <= dt <= cutoff]
-    already_open = [(t, dt) for t, dt in enriched if dt < now_utc]
+    failed_or_updated = []
+    booked_keys: set = set()
 
-    if not tonight and not already_open:
-        print(f"Nothing opens in the next 6h. Next windows: {[(t['date'], dt.isoformat()) for t, dt in enriched]}")
-        return
+    for target in actionable:
+        result = process_target(target)
+        if result.get("_booked"):
+            booked_keys.add((target["date"], target["venue_id"]))
+        else:
+            failed_or_updated.append(result)
 
-    failed = []
-
-    for t, _dt in already_open:
-        print(f"Booking already-open target: {t['date']} venue {t['venue_id']}")
-        if not book_target(t):
-            failed.append({**t, "status": "polling"})
-
-    for t, open_dt in sorted(tonight, key=lambda x: x[1]):
-        print(f"Tonight: {t['date']} venue {t['venue_id']} opens at {open_dt.isoformat()}")
-        wait_until(open_dt)
-        if not book_target(t):
-            failed.append({**t, "status": "polling"})
-
-    attempted = {(t["date"], t["venue_id"]) for t, _ in (already_open + tonight)}
-    remaining = [t for t in targets if (t.get("date"), t.get("venue_id")) not in attempted]
-    save_targets(remaining + failed)
+    polling = [t for t in targets if t.get("status") == "polling"]
+    remaining = [
+        t for t in failed_or_updated
+        if (t.get("date"), t.get("venue_id")) not in booked_keys
+    ]
+    save_targets(polling + remaining)
 
 
 if __name__ == "__main__":

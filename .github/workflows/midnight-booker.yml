@@ -1,18 +1,29 @@
-name: Midnight Booker
+name: Booker
 
-# Triggered nightly by the cf-trigger Cloudflare Worker, with GHA schedule as backup.
+# Triggered hourly by the cf-trigger Cloudflare Worker. The scheduler queries the
+# ClassPass schedule API to decide whether to book now, wait until the release
+# moment within this hour, or flag the target for cancellation polling.
 
 on:
   # Primary trigger: Cloudflare Worker (`cf-trigger/`) fires `repository_dispatch`
-  # at 03:00 UTC. CF crons are reliable to within a minute; GHA schedule crons
+  # every hour. CF crons are reliable to within a minute; GHA `schedule:` crons
   # can be delayed 25min to several hours on small repos.
   repository_dispatch:
     types: [midnight-booker]
-  # Backup trigger in case the CF Worker fails. Same 03:00 UTC slot.
+  # Backup trigger in case the CF Worker fails. Same hourly cadence.
   # Keep until the Worker path has proven reliable for several weeks.
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
+
+# Serialize runs. A run that's sleeping until a release moment can be still
+# in-flight when the next hourly cron fires; without this, the new run would
+# race the sleeping one and both try to book. With concurrency, the second
+# run queues, then starts after the first commits its targets.json update,
+# at which point the booked target is gone and the second run is a no-op.
+concurrency:
+  group: classpass-booker
+  cancel-in-progress: false
 
 jobs:
   book:
