@@ -1,9 +1,10 @@
 name: Hourly Booker
 
 # Fires every hour via the cf-trigger Cloudflare Worker (primary) and a GHA
-# schedule cron (backup). The scheduler queries the ClassPass schedule API to
-# decide whether to book now, sleep until the release moment within this hour,
-# or flag the target for cancellation polling.
+# schedule cron (backup). Runs both the cancellation poller (fast, checks
+# existing polling targets) and the scheduler (may sleep until a release
+# moment, then book) in one job. Single commit at the end keeps targets.json
+# updates from racing each other.
 
 on:
   repository_dispatch:
@@ -14,19 +15,30 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:
 
-# Serialize runs. A run that's sleeping until a release moment can be still
-# in-flight when the next hourly cron fires; without this, the new run would
+# Serialize runs. A run that's sleeping until a release moment can still be
+# in-flight when the next hourly cron fires; without this the new run would
 # race the sleeping one and both try to book.
 concurrency:
   group: classpass-booker
   cancel-in-progress: false
 
 jobs:
-  book:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     permissions:
       contents: write
+    env:
+      SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+      SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+      RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+      CLASSPASS_AUTH_TOKEN: ${{ secrets.CLASSPASS_AUTH_TOKEN }}
+      CLASSPASS_USER_ID: ${{ secrets.CLASSPASS_USER_ID }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+      GOOGLE_EVENT_COLOR: ${{ secrets.GOOGLE_EVENT_COLOR }}
     steps:
       # `ref: master` (not the trigger SHA) so a queued run sees commits the
       # earlier in-flight run pushed while we were waiting on the concurrency lock.
@@ -37,26 +49,20 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
+      # Polling first: fast and predictable. If we put scheduler first and it
+      # sleeps 60min for a release, the poller would be delayed by that much
+      # within the hour for no benefit.
+      - name: Cancellation poll
+        run: python -u cancellation_poller.py
       - name: Attempt booking
         run: python -u scheduler.py
-        env:
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          CLASSPASS_AUTH_TOKEN: ${{ secrets.CLASSPASS_AUTH_TOKEN }}
-          CLASSPASS_USER_ID: ${{ secrets.CLASSPASS_USER_ID }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
-          GOOGLE_EVENT_COLOR: ${{ secrets.GOOGLE_EVENT_COLOR }}
       - name: Commit updated targets.json
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add targets.json
           if ! git diff --staged --quiet; then
-            git commit -m "chore: update targets after booking attempt"
+            git commit -m "chore: update targets after hourly run"
             # Rebase on the latest master before push to absorb commits another
             # run may have pushed while we were sleeping; retry once on race.
             git pull --rebase origin master || true

@@ -145,8 +145,7 @@ The booker workflow uses GHA `concurrency:` so only one run is in flight at a ti
 | Component | Trigger | What it does |
 |---|---|---|
 | `cf-trigger/` (Cloudflare Worker) | CF cron at `0 * * * *` (hourly) | Sends `repository_dispatch` to the GitHub repo |
-| `hourly-booker.yml` (GHA) | `repository_dispatch` + `schedule` hourly backup | Runs `scheduler.py`, which queries the API and books (or waits + books) |
-| `cancellation-poller.yml` (GHA) | Hourly | On polling targets: auto-books when matching classes open up (or emails if no auth token is set) |
+| `hourly-booker.yml` (GHA) | `repository_dispatch` + `schedule` hourly backup | Runs `cancellation_poller.py` first (auto-books polling targets if a spot opened), then `scheduler.py` (queries the API and books, or waits + books, or flags as polling). Single commit at the end |
 | `monday-prompt.yml` (GHA) | Every Monday ~9am ET | Emails upcoming booking windows for the next 2 weeks |
 | `validate-targets.yml` (GHA) | On `targets.json` push/PR | Lints the file, blocks merge if invalid |
 

@@ -78,7 +78,6 @@ Whether ClassPass actually releases at midnight venue-local is empirical. If not
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `hourly-booker.yml` | `repository_dispatch` (from CF Worker) + `schedule` (backup) + `workflow_dispatch` | Hourly booking attempt |
-| `cancellation-poller.yml` | `schedule` hourly | Watches polling targets; auto-books matching slots, email fallback if booking fails |
+| `hourly-booker.yml` | `repository_dispatch` (from CF Worker) + `schedule` (backup) + `workflow_dispatch` | Runs `cancellation_poller.py` then `scheduler.py` in one job. Poller first because it's fast and predictable; scheduler may sleep up to 75 min waiting for a release moment |
 | `monday-prompt.yml` | `schedule` Monday 9am ET | Weekly email reminder to confirm targets |
 | `validate-targets.yml` | Push/PR touching `targets.json` | Lints schema; blocks merge on failure |
