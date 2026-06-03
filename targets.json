@@ -6,9 +6,15 @@
       "date": "2026-06-10",
       "class_name_contains": "Signature50",
       "preferences": [
-        {"time": "20:15"},
-        {"time": "19:15"},
-        {"time": "21:15"}
+        {
+          "time": "20:15"
+        },
+        {
+          "time": "19:15"
+        },
+        {
+          "time": "21:15"
+        }
       ]
     }
   ]
