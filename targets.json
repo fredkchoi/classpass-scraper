@@ -1,11 +1,15 @@
 {
   "targets": [
     {
+      "label": "June 10 evening solidcore LIC",
       "venue_id": 235412,
       "date": "2026-06-10",
-      "time": "20:15",
       "class_name_contains": "Signature50",
-      "teacher_contains": "Juan Zapata"
+      "preferences": [
+        {"time": "20:15"},
+        {"time": "19:15"},
+        {"time": "21:15"}
+      ]
     }
   ]
 }

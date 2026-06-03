@@ -69,24 +69,39 @@ Pre-populate this with everything you want to book — the scheduler picks up en
 ```json
 {
   "targets": [
-    {"venue_id": 235412, "date": "2026-06-10", "time": "07:30", "class_name_contains": "Signature50"},
-    {"venue_id": 235412, "date": "2026-06-17", "time": "07:30", "class_name_contains": "Signature50", "max_credits": 16}
+    {
+      "label": "June 10 evening solidcore LIC",
+      "venue_id": 235412,
+      "date": "2026-06-10",
+      "class_name_contains": "Signature50",
+      "preferences": [
+        {"time": "20:15"},
+        {"time": "19:15"},
+        {"time": "21:15"}
+      ]
+    }
   ]
 }
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `venue_id` | yes | Numeric ClassPass venue ID |
-| `date` | yes | `YYYY-MM-DD` — date of the class |
-| `time` | no | `HH:MM` (24hr, venue-local). If omitted, books the first matching class |
-| `class_name_contains` | no | Case-insensitive substring match on the class name |
-| `teacher_contains` | no | Case-insensitive substring match on the teacher name |
-| `max_credits` | no | Refuse to book if the class costs more than this (dynamic pricing safety cap) |
-| `release_at` | no | ISO datetime override for when the booking window opens (e.g. `"2026-06-03T05:00:00"`). Normally inferred from the API; only set this if the API message format changes or you want to test |
-| `status` | auto | Set to `"polling"` by the booker when an initial attempt fails |
+Each target represents a single intention (e.g. "get me into a class on June 10 evening"). Inside it, a `preferences` array lists priority-ordered alternatives. The scheduler tries each in order at the release moment and the first available preference wins. The confirmation email lists every preference and notes which one was actually booked.
 
-After each successful booking the target is removed automatically; failed targets are converted to polling entries for the cancellation poller.
+Top-level fields are inherited by every preference; per-preference fields override. So if every preference shares the same venue, date, and class name, you only write those once.
+
+| Field | Level | Required | Description |
+|---|---|---|---|
+| `label` | target | no | Human-readable name, used in logs and emails |
+| `venue_id` | either | yes | Numeric ClassPass venue ID |
+| `date` | either | yes | `YYYY-MM-DD` |
+| `time` | either | no | `HH:MM` (24hr, venue-local). Omit to match any time |
+| `class_name_contains` | either | no | Case-insensitive substring match on the class name |
+| `teacher_contains` | either | no | Case-insensitive substring match on the teacher name |
+| `max_credits` | either | no | Refuse to book if the class costs more than this |
+| `release_at` | either | no | ISO datetime override for when the booking window opens. Normally inferred from the API; set this only if the API message format changes or you want to test |
+| `preferences` | target | no | Priority-ordered array of partial preference dicts. Omit to treat the target's top-level fields as a single preference |
+| `status` | target | auto | Set to `"polling"` by the booker when no preference can be booked |
+
+Backward-compatible: if a target has no `preferences` array, its top-level fields are treated as a single preference. After a successful booking the target is removed; if every preference is unavailable the whole target moves to polling.
 
 ## Usage
 

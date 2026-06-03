@@ -26,7 +26,7 @@ The booking job is triggered by a Cloudflare Worker cron (more reliable than GHA
 | `cancellation_poller.py` | Hourly job that watches polling targets. Auto-books via `attempt_booking` when a matching slot opens; emails if no token is configured or booking fails |
 | `gcal.py` | Google Calendar event creation after a booking |
 | `monday_prompt.py` | Weekly Monday email summarizing upcoming booking windows |
-| `targets.json` | What to book. Schema: `venue_id`, `date`, `time?`, `class_name_contains?`, `teacher_contains?`, `max_credits?`, `lead_days?` |
+| `targets.json` | What to book. Each target has hoisted common fields (`venue_id`, `date`, etc.) and an optional `preferences` array of priority-ordered alternatives. Each preference can override any field. If `preferences` is absent the target itself is treated as one preference. |
 | `validate_targets.py` | Schema linter for `targets.json` (run in CI on every push) |
 | `config.py` | Env var loading |
 | `notifier.py` | Email notifications via Gmail SMTP |
@@ -67,11 +67,11 @@ Whether ClassPass actually releases at midnight venue-local is empirical. If not
 - **Workflow `concurrency:`** serializes runs. Prevents an in-flight sleeping run from racing the next hourly dispatch on the reservation endpoint.
 - **Booking semantics (`scheduler.py`)**:
   - Excludes polling targets (those are owned by `cancellation_poller.py`)
-  - For each remaining target: query the schedule API, branch on `availability.status` + `availability.reason`
-  - `available` -> book immediately with up to 5 min of retries
-  - `out_of_spots` -> flag as `status: polling`
-  - `before_opening_window` -> parse `availability.credits_reasons` for the release datetime (or use the `release_at` override on the target). If within next 75 min, sleep until that exact moment then book. Otherwise skip (next hourly run picks it up).
-  - Failed bookings: written back to `targets.json` with `"status": "polling"`
+  - For each remaining target, expand into a priority-ordered list of preferences (via `expand_preferences`), then query the schedule API per preference
+  - If any preference is currently `available`, book in priority order
+  - Else find the earliest `before_opening_window` release time across all preferences. If within next 75 min, sleep until then, then try every preference in priority order. First successful book wins
+  - If all preferences are `out_of_spots` (or all booking attempts fail), the whole target moves to `status: polling`
+  - Failed bookings are written back to `targets.json` for the cancellation poller, which also iterates preferences in priority order
 
 ## Workflows
 

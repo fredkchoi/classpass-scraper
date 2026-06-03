@@ -1,15 +1,14 @@
 """
-Polls for cancellations on targets where the initial booking failed.
+Polls for cancellations on targets the booker couldn't complete (status="polling").
 Runs hourly via GitHub Actions.
 
-When a matching available class is found, tries to book it directly. If the
-booking succeeds, emails confirmation and drops the target. If it fails
-(e.g. the spot was taken between the search and the reserve), keeps polling.
+For each polling target, iterates through the target's preferences in priority
+order. The first preference whose class is currently available gets booked.
+On book success the target is removed from targets.json; otherwise it stays
+polling for the next hour.
 
 If CLASSPASS_AUTH_TOKEN is not set, falls back to email-only mode (the user
 must book manually via the link).
-
-Polling targets are marked with `"status": "polling"` in targets.json by scheduler.py.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from notifier import send_email
 from availability import find_matches
+from scheduler import expand_preferences, _format_preferences_list, _book_pref
 
 TARGETS_FILE = os.path.join(os.path.dirname(__file__), "targets.json")
 BOOKING_URL_FMT = "https://classpass.com/classes/{schedule_id}"
@@ -39,73 +39,84 @@ def save_targets(targets: list):
 
 
 def _is_expired(target: dict) -> bool:
-    """True if the target's class date has already passed."""
-    try:
-        d = date.fromisoformat(target["date"])
-    except (KeyError, ValueError):
+    """True if every preference's class date has already passed."""
+    today = datetime.now(ZoneInfo("UTC")).date()
+    prefs = expand_preferences(target)
+    if not prefs:
         return True
-    return d < datetime.now(ZoneInfo("UTC")).date()
-
-
-def _try_auto_book(target: dict) -> dict | None:
-    """Attempt to reserve via book.attempt_booking. Returns the result dict or None."""
-    from book import attempt_booking
-    return attempt_booking(
-        venue_id=target["venue_id"],
-        date_str=target["date"],
-        time_str=target.get("time"),
-        class_name_contains=target.get("class_name_contains"),
-        teacher_contains=target.get("teacher_contains"),
-        max_credits=target.get("max_credits"),
-    )
-
-
-def _email_booked(result: dict):
-    m = result.get("_match", {})
-    start = m.get("start_time")
-    body = (
-        f"Booked {m.get('class_name', 'a class')} on {m.get('start_time').strftime('%Y-%m-%d') if start else ''} via cancellation polling!\n\n"
-        f"  - Venue: {m.get('venue_name')}\n"
-        f"  - Time: {start.strftime('%I:%M %p %Z') if start else ''}\n"
-        f"  - Teacher: {m.get('teacher_name')}\n"
-        f"  - Cost: {m.get('credits')} credits\n\n"
-        "(Caught via the hourly cancellation poller.)\n\n"
-        "- Your ClassPass Bot"
-    )
-    print(body)
-    send_email(subject=f"Booked: ClassPass {m.get('start_time').strftime('%Y-%m-%d') if start else ''}", body=body)
-
-    if start and os.getenv("GOOGLE_REFRESH_TOKEN"):
+    for p in prefs:
         try:
-            from gcal import create_booking_event
-            duration = m.get("duration_minutes") or 50
-            end = start + timedelta(minutes=duration)
-            create_booking_event(
-                start_dt=start,
-                end_dt=end,
-                summary=f"{m.get('class_name')} @ {m.get('venue_name')}",
-                location_name=m.get("venue_name", ""),
-                tz_name=m.get("venue_tz", "America/New_York"),
-            )
-        except Exception as e:
-            print(f"[gcal] Skipping calendar event: {e}")
+            d = date.fromisoformat(p["date"])
+        except (KeyError, ValueError):
+            continue
+        if d >= today:
+            return False
+    return True
 
 
-def _email_open(matches: list, date_str: str):
-    """Fallback email when we can't auto-book (no token configured)."""
+def _email_open_matches(target_label: str, hits: list[tuple[int, dict, dict]], prefs: list[dict]):
+    """Fallback email when no auth token is configured."""
+    if not hits:
+        return
     lines = []
-    for m in matches:
+    for idx, _p, m in hits:
         url = BOOKING_URL_FMT.format(schedule_id=m["schedule_id"])
         lines.append(
-            f"  - {m['start_time'].strftime('%I:%M %p')} - {m['class_name']} "
-            f"({m['teacher_name']}) - {m['credits']} credits\n    {url}"
+            f"  - Preference {idx + 1} ({m['start_time'].strftime('%I:%M %p')}): "
+            f"{m['class_name']} ({m['teacher_name']}) - {m['credits']} credits\n    {url}"
         )
     body = (
-        f"A spot opened up for {matches[0]['venue_name']} on {date_str}:\n\n"
+        f"A cancellation opened up for {target_label}:\n\n"
         + "\n".join(lines)
+        + "\n\nFrom your priority list:\n"
+        + _format_preferences_list(prefs)
         + "\n\n- Your ClassPass Bot"
     )
-    send_email(subject=f"Cancellation available: ClassPass {date_str}", body=body)
+    send_email(subject=f"Cancellation available: ClassPass {target_label}", body=body)
+
+
+def process_polling_target(target: dict, has_token: bool) -> dict | None:
+    """Return None if the target was booked or should be dropped, else the updated target."""
+    prefs = expand_preferences(target)
+    if not prefs:
+        return None
+
+    target_label = target.get("label") or (
+        f"venue {prefs[0]['venue_id']} {prefs[0]['date']}"
+    )
+    print(f"\n=== {target_label} (polling) ===")
+
+    hits: list[tuple[int, dict, dict]] = []
+    for i, p in enumerate(prefs):
+        matches = find_matches(
+            venue_id=p["venue_id"],
+            date_str=p["date"],
+            time_str=p.get("time"),
+            class_name_contains=p.get("class_name_contains"),
+            teacher_contains=p.get("teacher_contains"),
+            only_available=True,
+        )
+        if matches:
+            hits.append((i, p, matches[0]))
+            print(f"  [{i + 1}/{len(prefs)}] available!")
+        else:
+            print(f"  [{i + 1}/{len(prefs)}] no spot yet")
+
+    if not hits:
+        return target  # keep polling
+
+    if not has_token:
+        _email_open_matches(target_label, hits, prefs)
+        return None  # drop after notifying
+
+    # Auto-book in priority order
+    for i, p, _m in hits:
+        if _book_pref(target_label, p, i + 1, len(prefs), prefs):
+            return None  # booked, drop from polling
+
+    # All booking attempts failed; keep polling
+    print("All available preferences failed to book; keeping in polling state.")
+    return target
 
 
 def main():
@@ -116,55 +127,17 @@ def main():
         return
 
     has_token = bool(os.getenv("CLASSPASS_AUTH_TOKEN"))
-    still_watching = []
-    booked_keys: set = set()
+    non_polling = [t for t in targets if t.get("status") != "polling"]
+    remaining_polling: list = []
 
     for target in polling:
         if _is_expired(target):
-            print(f"Dropping expired polling target: {target.get('date')}")
+            print(f"Dropping expired polling target: {target.get('label') or target.get('date')}")
             continue
+        result = process_polling_target(target, has_token)
+        if result is not None:
+            remaining_polling.append(result)
 
-        venue_id = target["venue_id"]
-        date_str = target["date"]
-        label = f"venue {venue_id} {date_str} {target.get('time') or 'any'} {target.get('class_name_contains') or ''}".strip()
-        print(f"Checking cancellations for {label}...")
-
-        matches = find_matches(
-            venue_id=venue_id,
-            date_str=date_str,
-            time_str=target.get("time"),
-            class_name_contains=target.get("class_name_contains"),
-            teacher_contains=target.get("teacher_contains"),
-            only_available=True,
-        )
-        if not matches:
-            print(f"No availability yet for {label}.")
-            still_watching.append(target)
-            continue
-
-        if has_token:
-            try:
-                result = _try_auto_book(target)
-            except Exception as e:
-                print(f"[poller] auto-book raised: {e}")
-                result = None
-
-            if result:
-                _email_booked(result)
-                booked_keys.add((date_str, venue_id))
-                continue
-            print(f"[poller] auto-book did not complete; keeping target in polling for next hour")
-            still_watching.append(target)
-        else:
-            print(f"No CLASSPASS_AUTH_TOKEN set; emailing match instead of booking.")
-            _email_open(matches, date_str)
-            booked_keys.add((date_str, venue_id))
-
-    non_polling = [t for t in targets if t.get("status") != "polling"]
-    remaining_polling = [
-        t for t in still_watching
-        if (t["date"], t["venue_id"]) not in booked_keys
-    ]
     save_targets(non_polling + remaining_polling)
 
 
