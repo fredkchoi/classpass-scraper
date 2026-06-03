@@ -291,7 +291,8 @@ def _emit_booked_email_and_calendar(target_label, pref, fresh_match, credits, in
 
 
 def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, total: int,
-                    prefs: list[dict], balance: int | None) -> bool:
+                    prefs: list[dict], balance: int | None,
+                    outcomes: list[str] | None = None) -> bool:
     """
     Release-moment booker. Skips the per-attempt search round-trip used by
     `_book_pref` by reusing the schedule_id from the pre-window match, and
@@ -299,12 +300,22 @@ def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, 
     search refreshes the dynamic credit cost (pre-window the API returns None).
     Falls back to retail_price_in_credits when even the post-release search
     hasn't populated credits yet.
+
+    If `outcomes` is provided, the function records a per-preference failure
+    reason at outcomes[index-1] when it returns False, for use in the
+    "couldn't book" email.
     """
     from book import reserve
 
+    def _fail(reason: str) -> bool:
+        print(f"  pref {index}: {reason}")
+        if outcomes is not None and 0 <= index - 1 < len(outcomes):
+            outcomes[index - 1] = reason
+        return False
+
     schedule_id = pre_match.get("schedule_id")
     if not schedule_id:
-        return False
+        return _fail("no schedule_id resolved")
 
     # One refresh to pin current credits cost. Pre-window matches always have
     # credits=None; at/after release the API populates it.
@@ -315,34 +326,32 @@ def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, 
         or pre_match.get("retail_price_in_credits")
     )
     if not credits:
-        print(f"  pref {index}: no credit cost available, skipping")
-        return False
+        return _fail("no credit cost available at release")
 
     max_c = pref.get("max_credits")
     if max_c is not None and credits > max_c:
-        print(f"  pref {index}: cost {credits} > cap {max_c}, skipping")
-        return False
+        return _fail(f"unaffordable (cost={credits} > max_credits={max_c})")
     if balance is not None and credits > balance:
-        print(f"  pref {index}: cost {credits} > balance {balance}, skipping")
-        return False
+        return _fail(f"insufficient credits (cost={credits}, balance={balance})")
 
     pref_label = f"[{index}/{total}] {pref.get('time') or 'any'}"
     print(f"[{target_label}] {pref_label} firing reserve loop (schedule={schedule_id}, credits={credits})")
     deadline = datetime.now() + timedelta(minutes=BOOK_RETRY_MINUTES)
     attempt = 0
+    last_msg = ""
     while datetime.now() < deadline:
         attempt += 1
         try:
             reserve(schedule_id, credits)
         except Exception as e:
             msg = str(e)[:300].lower()
+            last_msg = msg
             # Hard-fail for unrecoverable signals to free up time for next preference
             if any(s in msg for s in (
                 "out_of_spots", "no_spots", "no spot", "full", "sold out",
                 "already_booked", "already reserved", "already_reserved",
             )):
-                print(f"  attempt {attempt}: {msg}; moving to next preference")
-                return False
+                return _fail(f"reservation rejected: {msg[:140]}")
             # Quiet log for the common HTTP 4xx case (window-not-open retries)
             if attempt == 1 or attempt % 20 == 0:
                 print(f"  attempt {attempt}: {msg}")
@@ -352,17 +361,64 @@ def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, 
         _emit_booked_email_and_calendar(target_label, pref, fresh, credits, index, total, prefs)
         return True
 
-    print(f"  {pref_label} exhausted {BOOK_RETRY_MINUTES} min")
-    return False
+    return _fail(f"all reserve retries exhausted in {BOOK_RETRY_MINUTES} min; last error: {last_msg[:140]}")
 
 
-def _notify_target_moved_to_polling(target_label: str, prefs: list[dict], reason: str):
-    body = (
-        f"Could not auto-book {target_label} during this run.\n\n"
-        f"Reason: {reason}\n\n"
-        f"Preferences attempted (priority order):\n"
-        f"{_format_preferences_list(prefs)}\n\n"
-        "The target is now in polling mode. The cancellation poller will keep "
+def _pick_polling_reason_line(outcomes: list[str], balance: int | None) -> str:
+    """Render the top-line `Reason:` text for the polling email based on the
+    actual per-preference outcomes. Distinguishes insufficient-credits from
+    sold-out so the user knows what to do."""
+    actual = [o for o in outcomes if o]
+    if not actual:
+        return "Release window opened but no preference could be reserved."
+    insufficient = [o for o in actual if "insufficient credits" in o or "unaffordable" in o]
+    sold_out = [o for o in actual if "out_of_spots" in o or "reservation rejected" in o]
+    if len(insufficient) == len(actual):
+        bal_text = f" (balance: {balance})" if balance is not None else ""
+        return f"All preferences cost more credits than you have{bal_text}; top up to enable booking."
+    if len(sold_out) == len(actual):
+        return "All preferences were sold out at or immediately after the release moment."
+    if insufficient and sold_out:
+        return (
+            f"Mix of insufficient credits (current balance: {balance}) and sold-out classes. "
+            "Topping up credits would have helped on at least one preference."
+        )
+    return "No preference could be reserved this run."
+
+
+def _notify_target_moved_to_polling(target_label: str, prefs: list[dict],
+                                    balance: int | None = None,
+                                    outcomes: list[str] | None = None,
+                                    fallback_reason: str | None = None):
+    """Email the user when a target couldn't be booked and is moving to polling.
+    Includes the per-preference outcomes so the user sees why each preference
+    failed (out_of_spots vs insufficient credits vs reserve timeout)."""
+    reason = (
+        _pick_polling_reason_line(outcomes, balance) if outcomes
+        else (fallback_reason or "No preference could be reserved this run.")
+    )
+
+    body = f"Could not auto-book {target_label} during this run.\n\nReason: {reason}\n\n"
+    if balance is not None:
+        body += f"Current credit balance: {balance}\n\n"
+
+    body += "Preferences attempted (priority order):\n"
+    for i, p in enumerate(prefs):
+        bits = []
+        if p.get("time"):
+            bits.append(f"time={p['time']}")
+        if p.get("class_name_contains"):
+            bits.append(f"class~={p['class_name_contains']}")
+        if p.get("teacher_contains"):
+            bits.append(f"teacher~={p['teacher_contains']}")
+        if p.get("max_credits") is not None:
+            bits.append(f"max_credits={p['max_credits']}")
+        label = ", ".join(bits) if bits else "(default)"
+        outcome = outcomes[i] if outcomes and i < len(outcomes) and outcomes[i] else "(no info)"
+        body += f"  {i + 1}. {label}\n     -> {outcome}\n"
+
+    body += (
+        "\nThe target is now in polling mode. The cancellation poller will keep "
         "checking hourly in case a spot opens up. To book manually, sign in at "
         "https://classpass.com/.\n\n"
         "- Your ClassPass Bot"
@@ -393,17 +449,35 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
     if not prefs:
         return target
 
-    # Match every preference once up front
+    # Match every preference once up front. Outcomes are populated as we
+    # observe each preference's state; we'll surface them in the polling email
+    # if no preference ends up booked.
     matched = []
+    outcomes: list[str] = [""] * len(prefs)
     for i, p in enumerate(prefs):
         cls = _match_for_pref(p)
         matched.append((i, p, cls))
-        if cls:
-            cost = cls.get("credits")
-            tag = "" if _is_affordable(cls, balance) else f" UNAFFORDABLE(cost={cost} > bal={balance})"
-            print(f"  [{i + 1}/{len(prefs)}] {p.get('time') or 'any'}: status={cls.get('status')} reason={cls.get('reason')} credits={cost}{tag}")
-        else:
+        if cls is None:
+            outcomes[i] = "no class found matching filters"
             print(f"  [{i + 1}/{len(prefs)}] {p.get('time') or 'any'}: no class found")
+            continue
+        cost = cls.get("credits")
+        status = cls.get("status")
+        reason = cls.get("reason")
+        if status == "available":
+            outcomes[i] = "available"
+        elif reason == "out_of_spots":
+            outcomes[i] = "out_of_spots"
+        elif reason == "before_opening_window":
+            outcomes[i] = "before_opening_window (waiting for release)"
+        else:
+            outcomes[i] = f"status={status} reason={reason}"
+        if not _is_affordable(cls, balance):
+            outcomes[i] = f"insufficient credits (cost={cost}, balance={balance})"
+            tag = f" UNAFFORDABLE(cost={cost} > bal={balance})"
+        else:
+            tag = ""
+        print(f"  [{i + 1}/{len(prefs)}] {p.get('time') or 'any'}: status={status} reason={reason} credits={cost}{tag}")
 
     # First pass: book any preference that's available right now, in priority order
     for i, p, cls in matched:
@@ -411,6 +485,7 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
             print(f"Preference {i + 1} is available. Attempting to book.")
             if _book_pref(target_label, p, i + 1, len(prefs), prefs):
                 return {"_booked": True}
+            outcomes[i] = "available but reservation failed"
             print(f"Preference {i + 1} book failed, falling through to next.")
 
     # Second pass: find earliest release time among affordable prefs still pre-window
@@ -441,14 +516,11 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
         for i, p, cls in matched:
             if not _is_affordable(cls, balance):
                 continue
-            if _book_pref_fast(target_label, p, cls, i + 1, len(prefs), prefs, balance):
+            if _book_pref_fast(target_label, p, cls, i + 1, len(prefs), prefs, balance, outcomes):
                 return {"_booked": True}
 
         print("No preference booked after release. Flagging target as polling.")
-        _notify_target_moved_to_polling(
-            target_label, prefs,
-            "Release window opened but no preference could be reserved (likely sold out within milliseconds).",
-        )
+        _notify_target_moved_to_polling(target_label, prefs, balance=balance, outcomes=outcomes)
         return {**target, "status": "polling"}
 
     # No release time found. If every preference is out_of_spots OR unaffordable -> polling.
@@ -457,10 +529,7 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
         for _, _, c in matched
     ):
         print("All preferences are out of spots or unaffordable. Flagging target as polling.")
-        _notify_target_moved_to_polling(
-            target_label, prefs,
-            "All preferences were out_of_spots or unaffordable when the run started.",
-        )
+        _notify_target_moved_to_polling(target_label, prefs, balance=balance, outcomes=outcomes)
         return {**target, "status": "polling"}
 
     # Mixed / unknown states (e.g. class not on schedule yet). Try again next hour.
