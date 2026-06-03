@@ -351,10 +351,17 @@ def _maybe_notify_token_stale(balance: int | None):
         return
     body = (
         "Could not fetch your ClassPass credit balance, which usually means "
-        "CLASSPASS_AUTH_TOKEN is stale.\n\n"
-        "Capture a fresh token from DevTools and update it in GitHub Secrets "
-        "(see README, 'Capturing your ClassPass auth token').\n\n"
-        "Booking attempts will likely fail until the token is rotated.\n\n"
+        "CLASSPASS_AUTH_TOKEN is stale. Booking attempts will likely fail "
+        "until it's rotated.\n\n"
+        "How to rotate:\n"
+        "  1. Sign in at https://classpass.com\n"
+        "  2. Open DevTools (F12), Network tab\n"
+        "  3. Click around to trigger any classpass.com/_api/... request\n"
+        "  4. Inspect that request's headers. Copy the value after 'Token ' "
+        "from the `cp-authorization` request header (a 40-char hex string)\n"
+        "  5. Open https://github.com/fredkchoi/classpass-scraper/settings/secrets/actions\n"
+        "  6. Edit the CLASSPASS_AUTH_TOKEN secret and paste the new value\n\n"
+        "The next hourly run will pick it up automatically; no redeploy needed.\n\n"
         "- Your ClassPass Bot"
     )
     print(body)
