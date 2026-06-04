@@ -1,9 +1,9 @@
 {
   "targets": [
     {
-      "label": "June 11 solidcore LIC",
+      "label": "June 12 solidcore LIC",
       "venue_id": 235412,
-      "date": "2026-06-11",
+      "date": "2026-06-12",
       "class_name_contains": "Signature50",
       "preferences": [
         {
@@ -22,8 +22,7 @@
           "time": "21:15"
         },
         {
-          "time": "22:15",
-          "class_name_contains": "Foundation50"
+          "time": "22:15"
         },
         {
           "time": "06:10"
@@ -31,8 +30,7 @@
         {
           "time": "07:10"
         }
-      ],
-      "status": "polling"
+      ]
     }
   ]
 }
