@@ -339,29 +339,56 @@ def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, 
     deadline = datetime.now() + timedelta(minutes=BOOK_RETRY_MINUTES)
     attempt = 0
     last_msg = ""
+    last_price_refresh = 0.0  # monotonic
     while datetime.now() < deadline:
         attempt += 1
         try:
             reserve(schedule_id, credits)
         except Exception as e:
-            msg = str(e)[:300].lower()
+            msg = str(e)[:500].lower()
             last_msg = msg
-            # Hard-fail for unrecoverable signals to free up time for next preference
+
+            # ClassPass error code 5017 = "no purchase option with the specified
+            # price is available for the provided schedule ID". Means our credits
+            # value is wrong (dynamic pricing). Refresh the schedule to pick up
+            # the right price, then retry immediately. The first few attempts
+            # right at release commonly hit this if dynamic pricing hadn't
+            # populated when we did the up-front search.
+            wrong_price = "5017" in msg or "no purchase option" in msg
+            if wrong_price:
+                now_mono = time.monotonic()
+                if now_mono - last_price_refresh > 0.3:  # rate-limit search calls
+                    last_price_refresh = now_mono
+                    refreshed = _match_for_pref(pref)
+                    new_credits = (refreshed or {}).get("credits")
+                    if new_credits and new_credits != credits:
+                        if balance is not None and new_credits > balance:
+                            return _fail(f"insufficient credits (cost={new_credits}, balance={balance})")
+                        max_c = pref.get("max_credits")
+                        if max_c is not None and new_credits > max_c:
+                            return _fail(f"unaffordable (cost={new_credits} > max_credits={max_c})")
+                        print(f"  pref {index} attempt {attempt}: price refresh {credits} -> {new_credits}")
+                        credits = new_credits
+                        continue  # retry immediately with the new price
+
+            # Hard-fail for unrecoverable signals. "no purchase option" appears
+            # in the same 5017 body and is handled above; abandon-list strings
+            # here should only match true sold-out responses.
             if any(s in msg for s in (
-                "out_of_spots", "no_spots", "no spot", "full", "sold out",
+                "out_of_spots", "sold out", "class is full",
                 "already_booked", "already reserved", "already_reserved",
             )):
                 return _fail(f"reservation rejected: {msg[:140]}")
             # Quiet log for the common HTTP 4xx case (window-not-open retries)
             if attempt == 1 or attempt % 20 == 0:
-                print(f"  attempt {attempt}: {msg}")
+                print(f"  attempt {attempt}: {msg[:200]}")
             time.sleep(FAST_RETRY_SECONDS)
             continue
 
         _emit_booked_email_and_calendar(target_label, pref, fresh, credits, index, total, prefs)
         return True
 
-    return _fail(f"all reserve retries exhausted in {BOOK_RETRY_MINUTES} min; last error: {last_msg[:140]}")
+    return _fail(f"all reserve retries exhausted in {BOOK_RETRY_MINUTES} min; last error: {last_msg[:200]}")
 
 
 def _pick_polling_reason_line(outcomes: list[str], balance: int | None) -> str:

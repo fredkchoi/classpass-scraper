@@ -40,7 +40,13 @@ def _headers() -> dict:
 
 
 def reserve(schedule_id: int, credits: int) -> dict:
-    """POST a reservation. Raises on any HTTP error (including 401 from a stale token)."""
+    """
+    POST a reservation. On non-2xx, raises RuntimeError with the response body
+    in the message so callers can branch on specific ClassPass error codes
+    (e.g. 5017 = "wrong price for this schedule, try a different credits value").
+    Using a plain RuntimeError-with-body instead of `raise_for_status()` because
+    the latter only carries the status code, not the body that explains why.
+    """
     url = f"{BASE_URL}/_api/v1/users/{CLASSPASS_USER_ID}/reservations"
     resp = requests.post(
         url,
@@ -50,8 +56,9 @@ def reserve(schedule_id: int, credits: int) -> dict:
         impersonate="chrome",
     )
     if not resp.ok:
-        print(f"[book] HTTP {resp.status_code}: {resp.text[:500]}")
-    resp.raise_for_status()
+        body = (resp.text or "")[:500]
+        print(f"[book] HTTP {resp.status_code}: {body}")
+        raise RuntimeError(f"HTTP {resp.status_code}: {body}")
     return resp.json()
 
 
