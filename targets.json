@@ -1,3 +1,42 @@
 {
-  "targets": []
+  "targets": [
+    {
+      "label": "June 13 solidcore LIC",
+      "venue_id": 235412,
+      "date": "2026-06-13",
+      "class_name_contains": "Signature50",
+      "preferences": [
+        {
+          "time": "09:00"
+        },
+        {
+          "time": "11:00"
+        },
+        {
+          "time": "12:00"
+        },
+        {
+          "time": "15:00"
+        },
+        {
+          "time": "16:00"
+        },
+        {
+          "time": "17:00"
+        },
+        {
+          "time": "18:00"
+        },
+        {
+          "time": "19:00"
+        },
+        {
+          "time": "20:00"
+        },
+        {
+          "time": "21:00"
+        }
+      ]
+    }
+  ]
 }
