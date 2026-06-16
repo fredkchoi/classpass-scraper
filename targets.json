@@ -23,7 +23,8 @@
         {
           "time": "07:10"
         }
-      ]
+      ],
+      "status": "polling"
     },
     {
       "label": "Jun 19 solidcore LIC",
