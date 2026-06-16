@@ -71,7 +71,7 @@ Whether ClassPass actually releases at midnight venue-local is empirical. If not
   - If any preference is currently `available`, book in priority order using `_book_pref` (search + reserve each attempt, 2 s retry, 5 min cap)
   - Else find the earliest `before_opening_window` release time across all preferences. If within next 75 min, sleep until then, then fire `_book_pref_fast` per preference (skips the per-attempt search by reusing the pre-window schedule_id; retries every `FAST_RETRY_SECONDS` = 0.15 s). The fast path matters because popular classes sell out in well under a second once the window opens
   - If all preferences are `out_of_spots` (or all booking attempts fail), the whole target moves to `status: polling` and a "couldn't book" email is sent. Failed bookings get written back to `targets.json` for the cancellation poller, which also iterates preferences in priority order
-  - Reservation cost (credits) is dynamic and can be `None` pre-window. The fast path does one refresh at release to get fresh credits, falling back to `retail_price_in_credits` if still missing
+  - Reservation cost (credits) is dynamic and can be `None` pre-window. The fast path does one refresh at release to get fresh credits; if still `None`, it polls the search endpoint every ~1 s inside the reserve loop until dynamic pricing populates. Does NOT fall back to `retail_price_in_credits` (rack rate differs from user's dynamic price and causes persistent 5017 errors)
   - Successful book → confirmation email + optional GCal event via `_emit_booked_email_and_calendar`
 
 ## Workflows

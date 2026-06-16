@@ -326,29 +326,47 @@ def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, 
 
     # One refresh to pin current credits cost. Pre-window matches always have
     # credits=None; at/after release the API populates it.
+    # Do NOT fall back to retail_price_in_credits: it is the rack rate and
+    # differs from the user's dynamic price, causing persistent 5017 errors.
+    # Instead, poll the search inside the reserve loop until a real price arrives.
     fresh = _match_for_pref(pref) or pre_match
-    credits = (
-        fresh.get("credits")
-        or fresh.get("retail_price_in_credits")
-        or pre_match.get("retail_price_in_credits")
-    )
-    if not credits:
-        return _fail("no credit cost available at release")
+    credits = fresh.get("credits") or pre_match.get("credits")
 
     max_c = pref.get("max_credits")
-    if max_c is not None and credits > max_c:
-        return _fail(f"unaffordable (cost={credits} > max_credits={max_c})")
-    if balance is not None and credits > balance:
-        return _fail(f"insufficient credits (cost={credits}, balance={balance})")
+    if credits is not None:
+        if max_c is not None and credits > max_c:
+            return _fail(f"unaffordable (cost={credits} > max_credits={max_c})")
+        if balance is not None and credits > balance:
+            return _fail(f"insufficient credits (cost={credits}, balance={balance})")
 
     pref_label = f"[{index}/{total}] {pref.get('time') or 'any'}"
-    print(f"[{target_label}] {pref_label} firing reserve loop (schedule={schedule_id}, credits={credits})")
+    print(f"[{target_label}] {pref_label} firing reserve loop (schedule={schedule_id}, credits={credits or 'TBD'})")
     deadline = datetime.now() + timedelta(minutes=BOOK_RETRY_MINUTES)
     attempt = 0
     last_msg = ""
     last_price_refresh = 0.0  # monotonic
     while datetime.now() < deadline:
         attempt += 1
+
+        # Dynamic price may not be populated right at window release.
+        # Refresh search every ~1 s until we have a real price rather than
+        # attempting a reservation with no credits value.
+        if not credits:
+            now_mono = time.monotonic()
+            if now_mono - last_price_refresh > 1.0:
+                last_price_refresh = now_mono
+                refreshed = _match_for_pref(pref)
+                credits = (refreshed or {}).get("credits")
+                if credits:
+                    print(f"  pref {index}: dynamic credits populated: {credits}")
+                    if max_c is not None and credits > max_c:
+                        return _fail(f"unaffordable (cost={credits} > max_credits={max_c})")
+                    if balance is not None and credits > balance:
+                        return _fail(f"insufficient credits (cost={credits}, balance={balance})")
+            if not credits:
+                time.sleep(1.0)
+                continue
+
         try:
             reserve(schedule_id, credits)
         except Exception as e:
@@ -377,6 +395,9 @@ def _book_pref_fast(target_label: str, pref: dict, pre_match: dict, index: int, 
                         print(f"  pref {index} attempt {attempt}: price refresh {credits} -> {new_credits}")
                         credits = new_credits
                         continue  # retry immediately with the new price
+                # Price still not resolved; back off to let ClassPass pricing populate
+                time.sleep(1.0)
+                continue
 
             # Hard-fail for unrecoverable signals. "no purchase option" appears
             # in the same 5017 body and is handled above; abandon-list strings
