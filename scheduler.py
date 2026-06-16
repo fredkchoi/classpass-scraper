@@ -195,8 +195,13 @@ def wait_until(target_dt: datetime):
         print(f"Already past {target_dt.isoformat()}, proceeding immediately.")
 
 
-def _book_pref(target_label: str, pref: dict, index: int, total: int, prefs: list[dict]) -> bool:
-    """Try to book one preference with up to BOOK_RETRY_MINUTES of retries."""
+def _book_pref(target_label: str, pref: dict, index: int, total: int, prefs: list[dict],
+               cancel_note: str | None = None) -> dict | None:
+    """Try to book one preference with up to BOOK_RETRY_MINUTES of retries.
+
+    Returns the booking result dict on success, None on failure. cancel_note is
+    appended to the confirmation email when provided (used for upgrade bookings).
+    """
     from book import attempt_booking
     pref_label = f"[{index}/{total}] {pref.get('time') or 'any time'}"
     deadline = datetime.now() + timedelta(minutes=BOOK_RETRY_MINUTES)
@@ -229,9 +234,11 @@ def _book_pref(target_label: str, pref: dict, index: int, total: int, prefs: lis
                 f"  - Teacher: {m.get('teacher_name')}\n"
                 f"  - Cost: {m.get('credits')} credits\n\n"
                 f"Booked preference {index} of {total} from your priority list:\n"
-                f"{_format_preferences_list(prefs)}\n\n"
-                "- Your ClassPass Bot"
+                f"{_format_preferences_list(prefs)}"
             )
+            if cancel_note:
+                body += f"\n\n{cancel_note}"
+            body += "\n\n- Your ClassPass Bot"
             print(body)
             send_email(subject=f"Booked: ClassPass {pref['date']}", body=body)
 
@@ -250,12 +257,12 @@ def _book_pref(target_label: str, pref: dict, index: int, total: int, prefs: lis
                 except Exception as e:
                     print(f"[gcal] Skipping calendar event: {e}")
 
-            return True
+            return result
         # Empty result means no available match this instant; back off briefly and retry
         time.sleep(2)
 
     print(f"  {pref_label} failed after {BOOK_RETRY_MINUTES} min of retries.")
-    return False
+    return None
 
 
 def _emit_booked_email_and_calendar(target_label, pref, fresh_match, credits, index, total, prefs):
@@ -511,7 +518,7 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
         if cls and cls.get("status") == "available" and _is_affordable(cls, balance):
             print(f"Preference {i + 1} is available. Attempting to book.")
             if _book_pref(target_label, p, i + 1, len(prefs), prefs):
-                return {"_booked": True}
+                return {"_booked": True, "_booked_index": i}
             outcomes[i] = "available but reservation failed"
             print(f"Preference {i + 1} book failed, falling through to next.")
 
@@ -544,7 +551,7 @@ def process_target(target: dict, run_start: datetime, balance: int | None) -> di
             if not _is_affordable(cls, balance):
                 continue
             if _book_pref_fast(target_label, p, cls, i + 1, len(prefs), prefs, balance, outcomes):
-                return {"_booked": True}
+                return {"_booked": True, "_booked_index": i}
 
         print("No preference booked after release. Flagging target as polling.")
         _notify_target_moved_to_polling(target_label, prefs, balance=balance, outcomes=outcomes)
@@ -589,6 +596,28 @@ def _maybe_notify_token_stale(balance: int | None):
     send_email(subject="ClassPass: auth token may be stale", body=body)
 
 
+def _build_upgrade_target(original: dict, booked_index: int) -> dict | None:
+    """Build an upgrade polling target for preferences ranked above the one just booked.
+
+    Returns None when there are no higher-ranked preferences to poll for.
+    """
+    higher_prefs = original.get("preferences", [])[0:booked_index]
+    if not higher_prefs:
+        return None
+    booked_pref = expand_preferences(original)[booked_index]
+    label = original.get("label") or f"venue {original.get('venue_id')} {original.get('date')}"
+    return {
+        **{k: v for k, v in original.items() if k not in ("status", "preferences", "label")},
+        "label": label + " (upgrade)",
+        "status": "upgrade_polling",
+        "original_booking": {
+            "time": booked_pref.get("time"),
+            "date": booked_pref.get("date"),
+        },
+        "preferences": higher_prefs,
+    }
+
+
 def main():
     from book import fetch_credit_balance
 
@@ -613,11 +642,18 @@ def main():
     new_targets: list = []
 
     for target in targets:
-        if target.get("status") == "polling":
+        if target.get("status") in ("polling", "upgrade_polling"):
             new_targets.append(target)
             continue
         result = process_target(target, run_start, balance)
-        if not result.get("_booked"):
+        if result.get("_booked"):
+            booked_index = result.get("_booked_index", 0)
+            if booked_index > 0 and target.get("preferences"):
+                upgrade = _build_upgrade_target(target, booked_index)
+                if upgrade:
+                    print(f"Queuing upgrade polling for {booked_index} higher-ranked preference(s).")
+                    new_targets.append(upgrade)
+        else:
             new_targets.append(result)
 
     save_targets(new_targets)

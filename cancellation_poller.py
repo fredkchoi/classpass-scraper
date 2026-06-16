@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from notifier import send_email
@@ -75,6 +75,22 @@ def _email_open_matches(target_label: str, hits: list[tuple[int, dict, dict]], p
     send_email(subject=f"Cancellation available: ClassPass {target_label}", body=body)
 
 
+def _cancel_reminder_note(original_booking: dict) -> str:
+    """Format the ACTION REQUIRED line appended to upgrade booking confirmations."""
+    time_str = original_booking.get("time", "")
+    date_str = original_booking.get("date", "")
+    try:
+        h, m = (int(x) for x in time_str.split(":"))
+        time_display = datetime(2000, 1, 1, h, m).strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        time_display = time_str
+    return (
+        f"ACTION REQUIRED: This is an upgrade booking. You still have a reservation "
+        f"for the {time_display} class on {date_str} - please cancel it on ClassPass "
+        f"(auto-cancel is not yet supported)."
+    )
+
+
 def process_polling_target(target: dict, has_token: bool, balance: int | None) -> dict | None:
     """Return None if the target was booked or should be dropped, else the updated target."""
     prefs = expand_preferences(target)
@@ -84,7 +100,14 @@ def process_polling_target(target: dict, has_token: bool, balance: int | None) -
     target_label = target.get("label") or (
         f"venue {prefs[0]['venue_id']} {prefs[0]['date']}"
     )
-    print(f"\n=== {target_label} (polling) ===")
+    is_upgrade = target.get("status") == "upgrade_polling"
+    print(f"\n=== {target_label} ({'upgrade ' if is_upgrade else ''}polling) ===")
+
+    cancel_note: str | None = None
+    if is_upgrade:
+        original = target.get("original_booking") or {}
+        if original.get("time") or original.get("date"):
+            cancel_note = _cancel_reminder_note(original)
 
     hits: list[tuple[int, dict, dict]] = []
     for i, p in enumerate(prefs):
@@ -117,7 +140,7 @@ def process_polling_target(target: dict, has_token: bool, balance: int | None) -
             print(f"  Preference {i + 1} unaffordable ({cost} > {balance}), skipping.")
             any_unaffordable = True
             continue
-        if _book_pref(target_label, p, i + 1, len(prefs), prefs):
+        if _book_pref(target_label, p, i + 1, len(prefs), prefs, cancel_note=cancel_note):
             return None  # booked, drop from polling
 
     # All booking attempts failed (or were unaffordable); keep polling so a credit
@@ -131,7 +154,7 @@ def process_polling_target(target: dict, has_token: bool, balance: int | None) -
 
 def main():
     targets = load_targets()
-    polling = [t for t in targets if t.get("status") == "polling"]
+    polling = [t for t in targets if t.get("status") in ("polling", "upgrade_polling")]
     if not polling:
         print("No cancellation polling targets.")
         return

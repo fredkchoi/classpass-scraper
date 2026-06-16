@@ -22,6 +22,7 @@ TARGET_LEVEL_FIELDS = {
     "release_at",
     "preferences",
     "status",
+    "original_booking",
 }
 PREF_LEVEL_FIELDS = {
     "venue_id",
@@ -32,7 +33,7 @@ PREF_LEVEL_FIELDS = {
     "max_credits",
     "release_at",
 }
-VALID_STATUSES = {"polling"}
+VALID_STATUSES = {"polling", "upgrade_polling"}
 MAX_DAYS_OUT = 60
 
 
