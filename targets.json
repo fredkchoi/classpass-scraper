@@ -4,8 +4,12 @@
       "label": "Jun 19 solidcore LIC",
       "venue_id": 235412,
       "date": "2026-06-19",
-      "time": "18:15",
-      "status": "polling"
+      "status": "polling",
+      "preferences": [
+        {"time": "18:15"},
+        {"time": "19:15"},
+        {"time": "20:15"}
+      ]
     }
   ]
 }
