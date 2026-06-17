@@ -1,6 +1,31 @@
 {
   "targets": [
     {
+      "label": "Jun 25 solidcore LIC",
+      "venue_id": 235412,
+      "date": "2026-06-25",
+      "preferences": [
+        {
+          "time": "18:15"
+        },
+        {
+          "time": "19:15"
+        },
+        {
+          "time": "20:15"
+        },
+        {
+          "time": "21:15"
+        },
+        {
+          "time": "06:10"
+        },
+        {
+          "time": "07:10"
+        }
+      ]
+    },
+    {
       "label": "Jun 23 solidcore LIC",
       "venue_id": 235412,
       "date": "2026-06-23",
@@ -25,19 +50,6 @@
         }
       ],
       "status": "polling"
-    },
-    {
-      "label": "Jun 25 solidcore LIC",
-      "venue_id": 235412,
-      "date": "2026-06-25",
-      "preferences": [
-        {"time": "18:15"},
-        {"time": "19:15"},
-        {"time": "20:15"},
-        {"time": "21:15"},
-        {"time": "06:10"},
-        {"time": "07:10"}
-      ]
     },
     {
       "label": "Jun 19 solidcore LIC",
